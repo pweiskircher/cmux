@@ -1082,6 +1082,8 @@ final class Workspace: Identifiable, ObservableObject {
         url: URL? = nil,
         focus: Bool = true
     ) -> BrowserPanel? {
+        guard CmuxFeatureFlags.browserEnabled else { return nil }
+
         // Find the pane containing the source panel
         guard let sourceTabId = surfaceIdFromPanelId(panelId) else { return nil }
         var sourcePaneId: PaneID?
@@ -1156,6 +1158,8 @@ final class Workspace: Identifiable, ObservableObject {
         insertAtEnd: Bool = false,
         bypassInsecureHTTPHostOnce: String? = nil
     ) -> BrowserPanel? {
+        guard CmuxFeatureFlags.browserEnabled else { return nil }
+
         let shouldFocusNewTab = focus ?? (bonsplitController.focusedPaneId == paneId)
 
         let browserPanel = BrowserPanel(

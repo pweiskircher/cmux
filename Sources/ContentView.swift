@@ -5119,13 +5119,17 @@ struct VerticalTabsSidebar: View {
                 .modifier(ClearScrollBackground())
             }
 #if DEBUG
-            SidebarDevFooter(updateViewModel: updateViewModel)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if CmuxFeatureFlags.sparkleEnabled {
+                SidebarDevFooter(updateViewModel: updateViewModel)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 #else
-            UpdatePill(model: updateViewModel)
-                .padding(.horizontal, 10)
-                .padding(.bottom, 10)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if CmuxFeatureFlags.sparkleEnabled {
+                UpdatePill(model: updateViewModel)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 #endif
         }
         .accessibilityIdentifier("Sidebar")

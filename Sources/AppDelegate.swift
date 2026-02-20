@@ -8,6 +8,23 @@ import WebKit
 import Combine
 import ObjectiveC.runtime
 
+enum CmuxFeatureFlags {
+    // Hard-disabled in this fork.
+    static let browserEnabled = false
+    static let sparkleEnabled = false
+    static let sentryEnabled = false
+    static let postHogEnabled = false
+}
+
+enum CmuxTelemetry {
+    static func captureScrollLag(samples: Int, averageMs: Double, maxMs: Double, thresholdMs: Double) {
+        _ = samples
+        _ = averageMs
+        _ = maxMs
+        _ = thresholdMs
+    }
+}
+
 enum FinderServicePathResolver {
     private static func canonicalDirectoryPath(_ path: String) -> String {
         guard path.count > 1 else { return path }
@@ -414,19 +431,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 #endif
 
-        SentrySDK.start { options in
-            options.dsn = "https://ecba1ec90ecaee02a102fba931b6d2b3@o4507547940749312.ingest.us.sentry.io/4510796264636416"
-            #if DEBUG
-            options.environment = "development"
-            options.debug = true
-            #else
-            options.environment = "production"
-            options.debug = false
-            #endif
-            options.sendDefaultPii = true
+        if CmuxFeatureFlags.sentryEnabled {
+            SentrySDK.start { options in
+                options.dsn = "https://ecba1ec90ecaee02a102fba931b6d2b3@o4507547940749312.ingest.us.sentry.io/4510796264636416"
+                #if DEBUG
+                options.environment = "development"
+                options.debug = true
+                #else
+                options.environment = "production"
+                options.debug = false
+                #endif
+                options.sendDefaultPii = true
+            }
         }
 
-        if !isRunningUnderXCTest {
+        if CmuxFeatureFlags.postHogEnabled, !isRunningUnderXCTest {
             PostHogAnalytics.shared.startIfNeeded()
         }
 
@@ -530,7 +549,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func applicationDidBecomeActive(_ notification: Notification) {
         let env = ProcessInfo.processInfo.environment
-        if !isRunningUnderXCTest(env) {
+        if CmuxFeatureFlags.postHogEnabled, !isRunningUnderXCTest(env) {
             PostHogAnalytics.shared.trackDailyActive(reason: "didBecomeActive")
         }
 
@@ -549,7 +568,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applicationWillTerminate(_ notification: Notification) {
         TerminalController.shared.stop()
         BrowserHistoryStore.shared.flushPendingSaves()
-        PostHogAnalytics.shared.flush()
+        if CmuxFeatureFlags.postHogEnabled {
+            PostHogAnalytics.shared.flush()
+        }
         notificationStore?.clearAll()
     }
 
@@ -1206,6 +1227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc func checkForUpdates(_ sender: Any?) {
+        guard CmuxFeatureFlags.sparkleEnabled else { return }
         updateViewModel.overrideState = nil
         updateController.checkForUpdates()
     }
@@ -1403,6 +1425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc func triggerSentryTestCrash(_ sender: Any?) {
+        guard CmuxFeatureFlags.sentryEnabled else { return }
         SentrySDK.crash()
     }
 #endif
