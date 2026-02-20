@@ -2492,4 +2492,5 @@ extension Notification.Name {
     static let browserDidFocusAddressBar = Notification.Name("browserDidFocusAddressBar")
     static let browserDidBlurAddressBar = Notification.Name("browserDidBlurAddressBar")
     static let webViewDidReceiveClick = Notification.Name("webViewDidReceiveClick")
+    static let webViewMiddleClickedLink = Notification.Name("webViewMiddleClickedLink")
 }

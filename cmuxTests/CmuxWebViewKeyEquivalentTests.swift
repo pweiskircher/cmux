@@ -339,6 +339,57 @@ final class WorkspacePlacementSettingsTests: XCTestCase {
     }
 }
 
+final class AppearanceSettingsTests: XCTestCase {
+    func testResolvedModeDefaultsToSystemWhenUnset() {
+        let suiteName = "AppearanceSettingsTests.Default.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.removeObject(forKey: AppearanceSettings.appearanceModeKey)
+
+        let resolved = AppearanceSettings.resolvedMode(defaults: defaults)
+        XCTAssertEqual(resolved, .system)
+        XCTAssertEqual(defaults.string(forKey: AppearanceSettings.appearanceModeKey), AppearanceMode.system.rawValue)
+    }
+
+    func testResolvedModeMigratesLegacyAndInvalidValuesToSystem() {
+        let suiteName = "AppearanceSettingsTests.Migrate.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set(AppearanceMode.auto.rawValue, forKey: AppearanceSettings.appearanceModeKey)
+        XCTAssertEqual(AppearanceSettings.resolvedMode(defaults: defaults), .system)
+        XCTAssertEqual(defaults.string(forKey: AppearanceSettings.appearanceModeKey), AppearanceMode.system.rawValue)
+
+        defaults.set("invalid-value", forKey: AppearanceSettings.appearanceModeKey)
+        XCTAssertEqual(AppearanceSettings.resolvedMode(defaults: defaults), .system)
+        XCTAssertEqual(defaults.string(forKey: AppearanceSettings.appearanceModeKey), AppearanceMode.system.rawValue)
+    }
+
+    func testResolvedModePreservesExplicitLightAndDark() {
+        let suiteName = "AppearanceSettingsTests.Preserve.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set(AppearanceMode.light.rawValue, forKey: AppearanceSettings.appearanceModeKey)
+        XCTAssertEqual(AppearanceSettings.resolvedMode(defaults: defaults), .light)
+        XCTAssertEqual(defaults.string(forKey: AppearanceSettings.appearanceModeKey), AppearanceMode.light.rawValue)
+
+        defaults.set(AppearanceMode.dark.rawValue, forKey: AppearanceSettings.appearanceModeKey)
+        XCTAssertEqual(AppearanceSettings.resolvedMode(defaults: defaults), .dark)
+        XCTAssertEqual(defaults.string(forKey: AppearanceSettings.appearanceModeKey), AppearanceMode.dark.rawValue)
+    }
+}
+
 final class UpdateChannelSettingsTests: XCTestCase {
     func testDefaultNightlyPreferenceIsDisabled() {
         XCTAssertFalse(UpdateChannelSettings.defaultIncludeNightlyBuilds)
@@ -1961,6 +2012,22 @@ final class GhosttySurfaceOverlayTests: XCTestCase {
         hostedView.setInactiveOverlay(color: .black, opacity: 0.35, visible: false)
         state = hostedView.debugInactiveOverlayState()
         XCTAssertTrue(state.isHidden)
+    }
+
+    func testUnreadNotificationRingVisibilityTracksRequestedState() {
+        let hostedView = GhosttySurfaceScrollView(
+            surfaceView: GhosttyNSView(frame: NSRect(x: 0, y: 0, width: 80, height: 50))
+        )
+
+        hostedView.setNotificationRing(visible: true)
+        var state = hostedView.debugNotificationRingState()
+        XCTAssertFalse(state.isHidden)
+        XCTAssertEqual(state.opacity, 1, accuracy: 0.001)
+
+        hostedView.setNotificationRing(visible: false)
+        state = hostedView.debugNotificationRingState()
+        XCTAssertTrue(state.isHidden)
+        XCTAssertEqual(state.opacity, 0, accuracy: 0.001)
     }
 }
 
