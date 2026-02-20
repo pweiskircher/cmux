@@ -479,8 +479,10 @@ struct ContentView: View {
         }
     }
 
-    /// Space at top of content area for the titlebar. This must be at least the actual titlebar
-    /// height; otherwise controls like Bonsplit tab dragging can be interpreted as window drags.
+    // Keep the custom workspace header bar (shows current directory).
+    private let showWorkspaceHeaderBar = true
+
+    /// Space at top of content area for the custom workspace header bar.
     @State private var titlebarPadding: CGFloat = 32
 
     private var terminalContent: some View {
@@ -515,10 +517,12 @@ struct ContentView: View {
                 .opacity(sidebarSelectionState.selection == .notifications ? 1 : 0)
                 .allowsHitTesting(sidebarSelectionState.selection == .notifications)
         }
-        .padding(.top, titlebarPadding)
+        .padding(.top, showWorkspaceHeaderBar ? titlebarPadding : 0)
         .overlay(alignment: .top) {
-            // Titlebar overlay is only over terminal content, not the sidebar.
-            customTitlebar
+            if showWorkspaceHeaderBar {
+                // Titlebar overlay is only over terminal content, not the sidebar.
+                customTitlebar
+            }
         }
     }
 
@@ -574,16 +578,6 @@ struct ContentView: View {
                 if isFullScreen && !sidebarState.isVisible {
                     fullscreenControls
                 }
-
-                // Draggable folder icon + focused command name
-                if let directory = focusedDirectory {
-                    DraggableFolderIcon(directory: directory)
-                }
-
-                Text(titlebarText)
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(fakeTitlebarTextColor)
-                    .lineLimit(1)
 
                 Spacer()
 
@@ -781,13 +775,22 @@ struct ContentView: View {
             AppDelegate.shared?.fullscreenControlsViewModel = nil
         }
 	        .ignoresSafeArea()
-	        .background(WindowAccessor { [sidebarBlendMode, bgGlassEnabled, bgGlassTintHex, bgGlassTintOpacity] window in
+	        .background(WindowAccessor { [sidebarBlendMode, bgGlassEnabled, bgGlassTintHex, bgGlassTintOpacity, showWorkspaceHeaderBar] window in
 	            window.identifier = NSUserInterfaceItemIdentifier(windowIdentifier)
+	            window.titleVisibility = .hidden
 	            window.titlebarAppearsTransparent = true
-	            // Do not make the entire background draggable; it interferes with drag gestures
-	            // like sidebar tab reordering in multi-window mode.
-	            window.isMovableByWindowBackground = false
+	            // When the custom header bar is hidden, allow dragging the window from
+	            // background areas in the tab strip region.
+	            window.isMovableByWindowBackground = !showWorkspaceHeaderBar
 	            window.styleMask.insert(.fullSizeContentView)
+	            if !showWorkspaceHeaderBar {
+	                if window.toolbar != nil {
+	                    window.toolbar = nil
+	                }
+	                if !window.titlebarAccessoryViewControllers.isEmpty {
+	                    window.titlebarAccessoryViewControllers.removeAll()
+	                }
+	            }
 
                 // Track this window for fullscreen notifications
                 if observedWindow !== window {
