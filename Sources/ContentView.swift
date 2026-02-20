@@ -1378,6 +1378,36 @@ private struct SidebarEmptyArea: View {
     }
 }
 
+private enum SidebarColorPalette {
+    static var accentIsLight: Bool {
+        NSColor(Color.accentColor).isLightColor
+    }
+
+    static var activePrimary: Color {
+        accentIsLight ? Color.black.opacity(0.92) : Color.white.opacity(0.95)
+    }
+
+    static var activeSecondary: Color {
+        accentIsLight ? Color.black.opacity(0.75) : Color.white.opacity(0.8)
+    }
+
+    static var activeMuted: Color {
+        accentIsLight ? Color.black.opacity(0.62) : Color.white.opacity(0.65)
+    }
+
+    static var activeBadgeBackground: Color {
+        accentIsLight ? Color.black.opacity(0.18) : Color.white.opacity(0.25)
+    }
+
+    static var activeProgressTrack: Color {
+        accentIsLight ? Color.black.opacity(0.12) : Color.white.opacity(0.15)
+    }
+
+    static var activeProgressFill: Color {
+        accentIsLight ? Color.black.opacity(0.65) : Color.white.opacity(0.8)
+    }
+}
+
 private struct TabItemView: View {
     @EnvironmentObject var tabManager: TabManager
     @EnvironmentObject var notificationStore: TerminalNotificationStore
@@ -1451,7 +1481,7 @@ private struct TabItemView: View {
                 if unreadCount > 0 {
                     ZStack {
                         Circle()
-                            .fill(isActive ? Color.white.opacity(0.25) : Color.accentColor)
+                            .fill(isActive ? SidebarColorPalette.activeBadgeBackground : Color.accentColor)
                         Text("\(unreadCount)")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundColor(.white)
@@ -1462,12 +1492,12 @@ private struct TabItemView: View {
                 if tab.isPinned {
                     Image(systemName: "pin.fill")
                         .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(isActive ? .white.opacity(0.8) : .secondary)
+                        .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
                 }
 
                 Text(tab.title)
                     .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundColor(isActive ? .white : .primary)
+                    .foregroundColor(isActive ? SidebarColorPalette.activePrimary : .primary)
                     .lineLimit(1)
                     .truncationMode(.tail)
 
@@ -1482,7 +1512,7 @@ private struct TabItemView: View {
                     }) {
                         Image(systemName: "xmark")
                             .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(isActive ? .white.opacity(0.7) : .secondary)
+                            .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
                     }
                     .buttonStyle(.plain)
                     .help("Close Workspace (\(StoredShortcut(key: "w", command: true, shift: true, option: false, control: false).displayString))")
@@ -1496,7 +1526,7 @@ private struct TabItemView: View {
                             .fixedSize(horizontal: true, vertical: false)
                             .font(.system(size: 10, weight: .semibold, design: .rounded))
                             .monospacedDigit()
-                            .foregroundColor(isActive ? .white : .primary)
+                            .foregroundColor(isActive ? SidebarColorPalette.activePrimary : .primary)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
                             .background(ShortcutHintPillBackground(emphasis: isActive ? 1.0 : 0.9))
@@ -1514,7 +1544,7 @@ private struct TabItemView: View {
             if let subtitle = latestNotificationText {
                 Text(subtitle)
                     .font(.system(size: 10))
-                    .foregroundColor(isActive ? .white.opacity(0.8) : .secondary)
+                    .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
                     .lineLimit(2)
                     .truncationMode(.tail)
                     .multilineTextAlignment(.leading)
@@ -1540,7 +1570,7 @@ private struct TabItemView: View {
                         .foregroundColor(logLevelColor(latestLog.level, isActive: isActive))
                     Text(latestLog.message)
                         .font(.system(size: 10))
-                        .foregroundColor(isActive ? .white.opacity(0.8) : .secondary)
+                        .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -1553,9 +1583,9 @@ private struct TabItemView: View {
                     GeometryReader { geo in
                         ZStack(alignment: .leading) {
                             Capsule()
-                                .fill(isActive ? Color.white.opacity(0.15) : Color.secondary.opacity(0.2))
+                                .fill(isActive ? SidebarColorPalette.activeProgressTrack : Color.secondary.opacity(0.2))
                             Capsule()
-                                .fill(isActive ? Color.white.opacity(0.8) : Color.accentColor)
+                                .fill(isActive ? SidebarColorPalette.activeProgressFill : Color.accentColor)
                                 .frame(width: max(0, geo.size.width * CGFloat(progress.value)))
                         }
                     }
@@ -1564,7 +1594,7 @@ private struct TabItemView: View {
                     if let label = progress.label {
                         Text(label)
                             .font(.system(size: 9))
-                            .foregroundColor(isActive ? .white.opacity(0.6) : .secondary)
+                            .foregroundColor(isActive ? SidebarColorPalette.activeMuted : .secondary)
                             .lineLimit(1)
                     }
                 }
@@ -1577,11 +1607,11 @@ private struct TabItemView: View {
                     if sidebarShowGitBranch && tab.gitBranch != nil && sidebarShowGitBranchIcon {
                         Image(systemName: "arrow.triangle.branch")
                             .font(.system(size: 9))
-                            .foregroundColor(isActive ? .white.opacity(0.6) : .secondary)
+                            .foregroundColor(isActive ? SidebarColorPalette.activeMuted : .secondary)
                     }
                     Text(dirRow)
                         .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(isActive ? .white.opacity(0.75) : .secondary)
+                        .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -1947,11 +1977,11 @@ private struct TabItemView: View {
     private func logLevelColor(_ level: SidebarLogLevel, isActive: Bool) -> Color {
         if isActive {
             switch level {
-            case .info: return .white.opacity(0.5)
-            case .progress: return .white.opacity(0.8)
-            case .success: return .white.opacity(0.9)
-            case .warning: return .white.opacity(0.9)
-            case .error: return .white.opacity(0.9)
+            case .info: return SidebarColorPalette.activeMuted
+            case .progress: return SidebarColorPalette.activeSecondary
+            case .success: return SidebarColorPalette.activePrimary
+            case .warning: return SidebarColorPalette.activePrimary
+            case .error: return SidebarColorPalette.activePrimary
             }
         }
         switch level {
@@ -2008,7 +2038,7 @@ private struct SidebarStatusPillsRow: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(statusText)
                 .font(.system(size: 10))
-                .foregroundColor(isActive ? .white.opacity(0.8) : .secondary)
+                .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
                 .lineLimit(isExpanded ? nil : 3)
                 .truncationMode(.tail)
                 .multilineTextAlignment(.leading)
@@ -2031,7 +2061,7 @@ private struct SidebarStatusPillsRow: View {
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(isActive ? .white.opacity(0.65) : .secondary.opacity(0.9))
+                .foregroundColor(isActive ? SidebarColorPalette.activeMuted : .secondary.opacity(0.9))
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
