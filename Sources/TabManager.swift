@@ -1388,12 +1388,14 @@ class TabManager: ObservableObject {
 
     /// Create a new browser panel in a split
     func newBrowserSplit(tabId: UUID, fromPanelId: UUID, orientation: SplitOrientation, url: URL? = nil) -> UUID? {
+        guard CmuxFeatureFlags.browserEnabled else { return nil }
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return nil }
         return tab.newBrowserSplit(from: fromPanelId, orientation: orientation, url: url)?.id
     }
 
     /// Create a new browser surface in a pane
     func newBrowserSurface(tabId: UUID, inPane paneId: PaneID, url: URL? = nil) -> UUID? {
+        guard CmuxFeatureFlags.browserEnabled else { return nil }
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return nil }
         return tab.newBrowserSurface(inPane: paneId, url: url)?.id
     }
@@ -1407,6 +1409,7 @@ class TabManager: ObservableObject {
     /// Open a browser in the currently focused pane (as a new surface)
     @discardableResult
     func openBrowser(url: URL? = nil, insertAtEnd: Bool = false) -> UUID? {
+        guard CmuxFeatureFlags.browserEnabled else { return nil }
         guard let tabId = selectedTabId,
               let tab = tabs.first(where: { $0.id == tabId }),
               let focusedPaneId = tab.bonsplitController.focusedPaneId else { return nil }

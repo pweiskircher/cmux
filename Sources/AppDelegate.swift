@@ -3,10 +3,36 @@ import SwiftUI
 import Bonsplit
 import CoreServices
 import UserNotifications
-import Sentry
 import WebKit
 import Combine
 import ObjectiveC.runtime
+
+enum CmuxFeatureFlags {
+    // Hard-disabled in this fork.
+    static let browserEnabled = false
+    static let sparkleEnabled = false
+    static let sentryEnabled = false
+    static let postHogEnabled = false
+}
+
+enum CmuxTelemetry {
+    static func start() {}
+
+    static func trackDailyActive(reason: String) {
+        _ = reason
+    }
+
+    static func flush() {}
+
+    static func captureScrollLag(samples: Int, averageMs: Double, maxMs: Double, thresholdMs: Double) {
+        _ = samples
+        _ = averageMs
+        _ = maxMs
+        _ = thresholdMs
+    }
+
+    static func triggerSentryCrashForDebug() {}
+}
 
 enum FinderServicePathResolver {
     private static func canonicalDirectoryPath(_ path: String) -> String {
@@ -292,20 +318,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 #endif
 
-        SentrySDK.start { options in
-            options.dsn = "https://ecba1ec90ecaee02a102fba931b6d2b3@o4507547940749312.ingest.us.sentry.io/4510796264636416"
-            #if DEBUG
-            options.environment = "development"
-            options.debug = true
-            #else
-            options.environment = "production"
-            options.debug = false
-            #endif
-            options.sendDefaultPii = true
-        }
-
         if !isRunningUnderXCTest {
-            PostHogAnalytics.shared.startIfNeeded()
+            CmuxTelemetry.start()
         }
 
         // UI tests frequently time out waiting for the main window if we do heavyweight
@@ -338,22 +352,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         installShortcutMonitor()
         NSApp.servicesProvider = self
 #if DEBUG
-        UpdateTestSupport.applyIfNeeded(to: updateController.viewModel)
-        if env["CMUX_UI_TEST_MODE"] == "1" {
-            let trigger = env["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"] ?? "<nil>"
-            let feed = env["CMUX_UI_TEST_FEED_URL"] ?? "<nil>"
-            UpdateLogStore.shared.append("ui test env: trigger=\(trigger) feed=\(feed)")
-        }
-        if env["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"] == "1" {
-            UpdateLogStore.shared.append("ui test trigger update check detected")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                guard let self else { return }
-                let windowIds = NSApp.windows.map { $0.identifier?.rawValue ?? "<nil>" }
-                UpdateLogStore.shared.append("ui test windows: count=\(NSApp.windows.count) ids=\(windowIds.joined(separator: ","))")
-                if UpdateTestSupport.performMockFeedCheckIfNeeded(on: self.updateController.viewModel) {
-                    return
+        if CmuxFeatureFlags.sparkleEnabled {
+            UpdateTestSupport.applyIfNeeded(to: updateController.viewModel)
+            if env["CMUX_UI_TEST_MODE"] == "1" {
+                let trigger = env["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"] ?? "<nil>"
+                let feed = env["CMUX_UI_TEST_FEED_URL"] ?? "<nil>"
+                UpdateLogStore.shared.append("ui test env: trigger=\(trigger) feed=\(feed)")
+            }
+            if env["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"] == "1" {
+                UpdateLogStore.shared.append("ui test trigger update check detected")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                    guard let self else { return }
+                    let windowIds = NSApp.windows.map { $0.identifier?.rawValue ?? "<nil>" }
+                    UpdateLogStore.shared.append("ui test windows: count=\(NSApp.windows.count) ids=\(windowIds.joined(separator: ","))")
+                    if UpdateTestSupport.performMockFeedCheckIfNeeded(on: self.updateController.viewModel) {
+                        return
+                    }
+                    self.checkForUpdates(nil)
                 }
-                self.checkForUpdates(nil)
             }
         }
 
@@ -408,7 +424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applicationDidBecomeActive(_ notification: Notification) {
         let env = ProcessInfo.processInfo.environment
         if !isRunningUnderXCTest(env) {
-            PostHogAnalytics.shared.trackDailyActive(reason: "didBecomeActive")
+            CmuxTelemetry.trackDailyActive(reason: "didBecomeActive")
         }
 
         guard let tabManager, let notificationStore else { return }
@@ -425,8 +441,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func applicationWillTerminate(_ notification: Notification) {
         TerminalController.shared.stop()
-        BrowserHistoryStore.shared.flushPendingSaves()
-        PostHogAnalytics.shared.flush()
+        if CmuxFeatureFlags.browserEnabled {
+            BrowserHistoryStore.shared.flushPendingSaves()
+        }
+        CmuxTelemetry.flush()
         notificationStore?.clearAll()
     }
 
@@ -733,6 +751,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc func checkForUpdates(_ sender: Any?) {
+        guard CmuxFeatureFlags.sparkleEnabled else { return }
         updateViewModel.overrideState = nil
         updateController.checkForUpdates()
     }
@@ -892,7 +911,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc func triggerSentryTestCrash(_ sender: Any?) {
-        SentrySDK.crash()
+        CmuxTelemetry.triggerSentryCrashForDebug()
     }
 #endif
 
@@ -1023,6 +1042,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func setupGotoSplitUITestIfNeeded() {
         guard !didSetupGotoSplitUITest else { return }
         didSetupGotoSplitUITest = true
+        guard CmuxFeatureFlags.browserEnabled else { return }
         let env = ProcessInfo.processInfo.environment
         guard env["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] == "1" else { return }
         guard tabManager != nil else { return }
@@ -1870,41 +1890,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
-        // Open browser: Cmd+Shift+L
-        if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .openBrowser)) {
-            if let panelId = tabManager?.openBrowser(insertAtEnd: true) {
-                focusBrowserAddressBar(panelId: panelId)
-            }
-            return true
-        }
-
-        // Focus browser address bar: Cmd+L
-        if flags == [.command] && chars == "l" {
-            if let focusedPanel = tabManager?.focusedBrowserPanel {
-                focusBrowserAddressBar(in: focusedPanel)
+        if CmuxFeatureFlags.browserEnabled {
+            // Open browser: Cmd+Shift+L
+            if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .openBrowser)) {
+                if let panelId = tabManager?.openBrowser(insertAtEnd: true) {
+                    focusBrowserAddressBar(panelId: panelId)
+                }
                 return true
             }
 
-            if let browserAddressBarFocusedPanelId,
-               focusBrowserAddressBar(panelId: browserAddressBarFocusedPanelId) {
-                return true
+            // Focus browser address bar: Cmd+L
+            if flags == [.command] && chars == "l" {
+                if let focusedPanel = tabManager?.focusedBrowserPanel {
+                    focusBrowserAddressBar(in: focusedPanel)
+                    return true
+                }
+
+                if let browserAddressBarFocusedPanelId,
+                   focusBrowserAddressBar(panelId: browserAddressBarFocusedPanelId) {
+                    return true
+                }
+
+                if let panelId = tabManager?.openBrowser(insertAtEnd: true) {
+                    focusBrowserAddressBar(panelId: panelId)
+                    return true
+                }
             }
 
-            if let panelId = tabManager?.openBrowser(insertAtEnd: true) {
-                focusBrowserAddressBar(panelId: panelId)
-                return true
-            }
-        }
-
-        if let action = browserZoomShortcutAction(flags: flags, chars: chars, keyCode: event.keyCode),
-           let manager = tabManager {
-            switch action {
-            case .zoomIn:
-                return manager.zoomInFocusedBrowser()
-            case .zoomOut:
-                return manager.zoomOutFocusedBrowser()
-            case .reset:
-                return manager.resetZoomFocusedBrowser()
+            if let action = browserZoomShortcutAction(flags: flags, chars: chars, keyCode: event.keyCode),
+               let manager = tabManager {
+                switch action {
+                case .zoomIn:
+                    return manager.zoomInFocusedBrowser()
+                case .zoomOut:
+                    return manager.zoomOutFocusedBrowser()
+                case .reset:
+                    return manager.resetZoomFocusedBrowser()
+                }
             }
         }
 
@@ -1913,6 +1935,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     @discardableResult
     private func focusBrowserAddressBar(panelId: UUID) -> Bool {
+        guard CmuxFeatureFlags.browserEnabled else { return false }
         guard let tabManager,
               let workspace = tabManager.selectedWorkspace,
               let panel = workspace.browserPanel(for: panelId) else {
@@ -1924,6 +1947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func focusBrowserAddressBar(in panel: BrowserPanel) {
+        guard CmuxFeatureFlags.browserEnabled else { return }
         _ = panel.requestAddressBarFocus()
         browserAddressBarFocusedPanelId = panel.id
         NotificationCenter.default.post(name: .browserFocusAddressBar, object: panel.id)
@@ -2190,7 +2214,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        updateController.validateMenuItem(item)
+        if CmuxFeatureFlags.sparkleEnabled {
+            _ = updateController.validateMenuItem(item)
+        }
+        return true
     }
 
 
@@ -2351,6 +2378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func installBrowserAddressBarFocusObservers() {
+        guard CmuxFeatureFlags.browserEnabled else { return }
         guard browserAddressBarFocusObserver == nil, browserAddressBarBlurObserver == nil else { return }
 
         browserAddressBarFocusObserver = NotificationCenter.default.addObserver(
@@ -2808,9 +2836,11 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        checkForUpdatesItem.target = self
-        checkForUpdatesItem.action = #selector(checkForUpdatesAction)
-        menu.addItem(checkForUpdatesItem)
+        if CmuxFeatureFlags.sparkleEnabled {
+            checkForUpdatesItem.target = self
+            checkForUpdatesItem.action = #selector(checkForUpdatesAction)
+            menu.addItem(checkForUpdatesItem)
+        }
 
         preferencesItem.target = self
         preferencesItem.action = #selector(preferencesAction)

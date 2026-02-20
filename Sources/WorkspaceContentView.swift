@@ -194,16 +194,18 @@ struct EmptyPanelView: View {
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut("t", modifiers: [.command])
 
-                Button {
-                    createBrowser()
-                } label: {
-                    HStack(spacing: 10) {
-                        Label("Browser", systemImage: "globe")
-                        ShortcutHint(text: "⌘⇧L")
+                if CmuxFeatureFlags.browserEnabled {
+                    Button {
+                        createBrowser()
+                    } label: {
+                        HStack(spacing: 10) {
+                            Label("Browser", systemImage: "globe")
+                            ShortcutHint(text: "⌘⇧L")
+                        }
                     }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
                 }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut("l", modifiers: [.command, .shift])
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

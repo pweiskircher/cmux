@@ -193,39 +193,45 @@ struct cmuxApp: App {
                     GhosttyApp.shared.reloadConfiguration()
                 }
                 .keyboardShortcut(",", modifiers: [.command, .shift])
-                Divider()
-                Button("Check for Updates…") {
-                    appDelegate.checkForUpdates(nil)
+                if CmuxFeatureFlags.sparkleEnabled {
+                    Divider()
+                    Button("Check for Updates…") {
+                        appDelegate.checkForUpdates(nil)
+                    }
+                    InstallUpdateMenuItem(model: appDelegate.updateViewModel)
                 }
-                InstallUpdateMenuItem(model: appDelegate.updateViewModel)
             }
 
 #if DEBUG
-            CommandMenu("Update Pill") {
-                Button("Show Update Pill") {
-                    appDelegate.showUpdatePill(nil)
-                }
-                Button("Show Long Nightly Pill") {
-                    appDelegate.showUpdatePillLongNightly(nil)
-                }
-                Button("Show Loading State") {
-                    appDelegate.showUpdatePillLoading(nil)
-                }
-                Button("Hide Update Pill") {
-                    appDelegate.hideUpdatePill(nil)
-                }
-                Button("Automatic Update Pill") {
-                    appDelegate.clearUpdatePillOverride(nil)
+            if CmuxFeatureFlags.sparkleEnabled {
+                CommandMenu("Update Pill") {
+                    Button("Show Update Pill") {
+                        appDelegate.showUpdatePill(nil)
+                    }
+                    Button("Show Long Nightly Pill") {
+                        appDelegate.showUpdatePillLongNightly(nil)
+                    }
+                    Button("Show Loading State") {
+                        appDelegate.showUpdatePillLoading(nil)
+                    }
+                    Button("Hide Update Pill") {
+                        appDelegate.hideUpdatePill(nil)
+                    }
+                    Button("Automatic Update Pill") {
+                        appDelegate.clearUpdatePillOverride(nil)
+                    }
                 }
             }
 #endif
 
-            CommandMenu("Update Logs") {
-                Button("Copy Update Logs") {
-                    appDelegate.copyUpdateLogs(nil)
-                }
-                Button("Copy Focus Logs") {
-                    appDelegate.copyFocusLogs(nil)
+            if CmuxFeatureFlags.sparkleEnabled {
+                CommandMenu("Update Logs") {
+                    Button("Copy Update Logs") {
+                        appDelegate.copyUpdateLogs(nil)
+                    }
+                    Button("Copy Focus Logs") {
+                        appDelegate.copyFocusLogs(nil)
+                    }
                 }
             }
 
@@ -317,10 +323,12 @@ struct cmuxApp: App {
                     }
                 }
 
-                Divider()
+                if CmuxFeatureFlags.sentryEnabled {
+                    Divider()
 
-                Button("Trigger Sentry Test Crash") {
-                    appDelegate.triggerSentryTestCrash(nil)
+                    Button("Trigger Sentry Test Crash") {
+                        appDelegate.triggerSentryTestCrash(nil)
+                    }
                 }
             }
 #endif
@@ -407,38 +415,40 @@ struct cmuxApp: App {
                     (AppDelegate.shared?.tabManager ?? tabManager).selectPreviousSurface()
                 }
 
-                Button("Back") {
-                    (AppDelegate.shared?.tabManager ?? tabManager).focusedBrowserPanel?.goBack()
-                }
-                .keyboardShortcut("[", modifiers: .command)
+                if CmuxFeatureFlags.browserEnabled {
+                    Button("Back") {
+                        (AppDelegate.shared?.tabManager ?? tabManager).focusedBrowserPanel?.goBack()
+                    }
+                    .keyboardShortcut("[", modifiers: .command)
 
-                Button("Forward") {
-                    (AppDelegate.shared?.tabManager ?? tabManager).focusedBrowserPanel?.goForward()
-                }
-                .keyboardShortcut("]", modifiers: .command)
+                    Button("Forward") {
+                        (AppDelegate.shared?.tabManager ?? tabManager).focusedBrowserPanel?.goForward()
+                    }
+                    .keyboardShortcut("]", modifiers: .command)
 
-                Button("Reload Page") {
-                    (AppDelegate.shared?.tabManager ?? tabManager).focusedBrowserPanel?.reload()
-                }
-                .keyboardShortcut("r", modifiers: .command)
+                    Button("Reload Page") {
+                        (AppDelegate.shared?.tabManager ?? tabManager).focusedBrowserPanel?.reload()
+                    }
+                    .keyboardShortcut("r", modifiers: .command)
 
-                Button("Zoom In") {
-                    _ = (AppDelegate.shared?.tabManager ?? tabManager).zoomInFocusedBrowser()
-                }
-                .keyboardShortcut("=", modifiers: .command)
+                    Button("Zoom In") {
+                        _ = (AppDelegate.shared?.tabManager ?? tabManager).zoomInFocusedBrowser()
+                    }
+                    .keyboardShortcut("=", modifiers: .command)
 
-                Button("Zoom Out") {
-                    _ = (AppDelegate.shared?.tabManager ?? tabManager).zoomOutFocusedBrowser()
-                }
-                .keyboardShortcut("-", modifiers: .command)
+                    Button("Zoom Out") {
+                        _ = (AppDelegate.shared?.tabManager ?? tabManager).zoomOutFocusedBrowser()
+                    }
+                    .keyboardShortcut("-", modifiers: .command)
 
-                Button("Actual Size") {
-                    _ = (AppDelegate.shared?.tabManager ?? tabManager).resetZoomFocusedBrowser()
-                }
-                .keyboardShortcut("0", modifiers: .command)
+                    Button("Actual Size") {
+                        _ = (AppDelegate.shared?.tabManager ?? tabManager).resetZoomFocusedBrowser()
+                    }
+                    .keyboardShortcut("0", modifiers: .command)
 
-                Button("Clear Browser History") {
-                    BrowserHistoryStore.shared.clearHistory()
+                    Button("Clear Browser History") {
+                        BrowserHistoryStore.shared.clearHistory()
+                    }
                 }
 
                 Button("Next Workspace") {
@@ -2377,45 +2387,49 @@ struct SettingsView: View {
                         SettingsCardNote("When enabled, cmux wraps the claude command to inject session tracking and notification hooks. Disable if you prefer to manage Claude Code hooks yourself.")
                     }
 
-                    SettingsSectionHeader(title: "Browser")
-                    SettingsCard {
-                        SettingsCardRow(
-                            "Default Search Engine",
-                            subtitle: "Used by the browser address bar when input is not a URL.",
-                            controlWidth: pickerColumnWidth
-                        ) {
-                            Picker("", selection: $browserSearchEngine) {
-                                ForEach(BrowserSearchEngine.allCases) { engine in
-                                    Text(engine.displayName).tag(engine.rawValue)
+                    if CmuxFeatureFlags.browserEnabled {
+                        SettingsSectionHeader(title: "Browser")
+                        SettingsCard {
+                            SettingsCardRow(
+                                "Default Search Engine",
+                                subtitle: "Used by the browser address bar when input is not a URL.",
+                                controlWidth: pickerColumnWidth
+                            ) {
+                                Picker("", selection: $browserSearchEngine) {
+                                    ForEach(BrowserSearchEngine.allCases) { engine in
+                                        Text(engine.displayName).tag(engine.rawValue)
+                                    }
                                 }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.menu)
-                        }
-
-                        SettingsCardDivider()
-
-                        SettingsCardRow("Show Search Suggestions") {
-                            Toggle("", isOn: $browserSearchSuggestionsEnabled)
                                 .labelsHidden()
-                                .controlSize(.small)
-                        }
-
-                        SettingsCardDivider()
-
-                        SettingsCardRow("Browsing History", subtitle: browserHistorySubtitle) {
-                            Button("Clear History…") {
-                                showClearBrowserHistoryConfirmation = true
+                                .pickerStyle(.menu)
                             }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(browserHistoryEntryCount == 0)
+
+                            SettingsCardDivider()
+
+                            SettingsCardRow("Show Search Suggestions") {
+                                Toggle("", isOn: $browserSearchSuggestionsEnabled)
+                                    .labelsHidden()
+                                    .controlSize(.small)
+                            }
+
+                            SettingsCardDivider()
+
+                            SettingsCardRow("Browsing History", subtitle: browserHistorySubtitle) {
+                                Button("Clear History…") {
+                                    showClearBrowserHistoryConfirmation = true
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(browserHistoryEntryCount == 0)
+                            }
                         }
                     }
 
                     SettingsSectionHeader(title: "Keyboard Shortcuts")
                     SettingsCard {
-                        let actions = KeyboardShortcutSettings.Action.allCases
+                        let actions = KeyboardShortcutSettings.Action.allCases.filter { action in
+                            CmuxFeatureFlags.browserEnabled || action != .openBrowser
+                        }
                         ForEach(Array(actions.enumerated()), id: \.element.id) { index, action in
                             ShortcutSettingRow(action: action)
                                 .padding(.horizontal, 14)
@@ -2524,10 +2538,18 @@ struct SettingsView: View {
         .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
         .toggleStyle(.switch)
         .onAppear {
+            guard CmuxFeatureFlags.browserEnabled else {
+                browserHistoryEntryCount = 0
+                return
+            }
             BrowserHistoryStore.shared.loadIfNeeded()
             browserHistoryEntryCount = BrowserHistoryStore.shared.entries.count
         }
         .onReceive(BrowserHistoryStore.shared.$entries) { entries in
+            guard CmuxFeatureFlags.browserEnabled else {
+                browserHistoryEntryCount = 0
+                return
+            }
             browserHistoryEntryCount = entries.count
         }
         .confirmationDialog(
