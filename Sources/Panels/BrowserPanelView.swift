@@ -3,6 +3,113 @@ import SwiftUI
 import WebKit
 import AppKit
 
+enum BrowserDevToolsIconOption: String, CaseIterable, Identifiable {
+    case wrenchAndScrewdriver = "wrench.and.screwdriver"
+    case wrenchAndScrewdriverFill = "wrench.and.screwdriver.fill"
+    case curlyBracesSquare = "curlybraces.square"
+    case curlyBraces = "curlybraces"
+    case terminalFill = "terminal.fill"
+    case terminal = "terminal"
+    case hammer = "hammer"
+    case hammerCircle = "hammer.circle"
+    case ladybug = "ladybug"
+    case ladybugFill = "ladybug.fill"
+    case scope = "scope"
+    case codeChevrons = "chevron.left.slash.chevron.right"
+    case gearshape = "gearshape"
+    case gearshapeFill = "gearshape.fill"
+    case globe = "globe"
+    case globeAmericas = "globe.americas.fill"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .wrenchAndScrewdriver: return "Wrench + Screwdriver"
+        case .wrenchAndScrewdriverFill: return "Wrench + Screwdriver (Fill)"
+        case .curlyBracesSquare: return "Curly Braces"
+        case .curlyBraces: return "Curly Braces (Plain)"
+        case .terminalFill: return "Terminal (Fill)"
+        case .terminal: return "Terminal"
+        case .hammer: return "Hammer"
+        case .hammerCircle: return "Hammer Circle"
+        case .ladybug: return "Bug"
+        case .ladybugFill: return "Bug (Fill)"
+        case .scope: return "Scope"
+        case .codeChevrons: return "Code Chevrons"
+        case .gearshape: return "Gear"
+        case .gearshapeFill: return "Gear (Fill)"
+        case .globe: return "Globe"
+        case .globeAmericas: return "Globe Americas (Fill)"
+        }
+    }
+}
+
+enum BrowserDevToolsIconColorOption: String, CaseIterable, Identifiable {
+    case bonsplitInactive
+    case bonsplitActive
+    case accent
+    case tertiary
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .bonsplitInactive: return "Bonsplit Inactive (Terminal/Globe)"
+        case .bonsplitActive: return "Bonsplit Active (Terminal/Globe)"
+        case .accent: return "Accent"
+        case .tertiary: return "Tertiary"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .bonsplitInactive:
+            // Matches Bonsplit tab icon tint for inactive tabs.
+            return Color(nsColor: .secondaryLabelColor)
+        case .bonsplitActive:
+            // Matches Bonsplit tab icon tint for active tabs.
+            return Color(nsColor: .labelColor)
+        case .accent:
+            return .accentColor
+        case .tertiary:
+            return Color(nsColor: .tertiaryLabelColor)
+        }
+    }
+}
+
+enum BrowserDevToolsButtonDebugSettings {
+    static let iconNameKey = "browserDevToolsIconName"
+    static let iconColorKey = "browserDevToolsIconColor"
+    static let defaultIcon = BrowserDevToolsIconOption.wrenchAndScrewdriver
+    static let defaultColor = BrowserDevToolsIconColorOption.bonsplitInactive
+
+    static func iconOption(defaults: UserDefaults = .standard) -> BrowserDevToolsIconOption {
+        guard let raw = defaults.string(forKey: iconNameKey),
+              let option = BrowserDevToolsIconOption(rawValue: raw) else {
+            return defaultIcon
+        }
+        return option
+    }
+
+    static func colorOption(defaults: UserDefaults = .standard) -> BrowserDevToolsIconColorOption {
+        guard let raw = defaults.string(forKey: iconColorKey),
+              let option = BrowserDevToolsIconColorOption(rawValue: raw) else {
+            return defaultColor
+        }
+        return option
+    }
+
+    static func copyPayload(defaults: UserDefaults = .standard) -> String {
+        let icon = iconOption(defaults: defaults)
+        let color = colorOption(defaults: defaults)
+        return """
+        browserDevToolsIconName=\(icon.rawValue)
+        browserDevToolsIconColor=\(color.rawValue)
+        """
+    }
+}
+
 struct OmnibarInlineCompletion: Equatable {
     let typedText: String
     let displayText: String
@@ -15,16 +122,65 @@ struct OmnibarInlineCompletion: Equatable {
     }
 }
 
+private struct OmnibarAddressButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        OmnibarAddressButtonStyleBody(configuration: configuration)
+    }
+}
+
+private struct OmnibarAddressButtonStyleBody: View {
+    let configuration: OmnibarAddressButtonStyle.Configuration
+
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var isHovered = false
+
+    private var backgroundOpacity: Double {
+        guard isEnabled else { return 0.0 }
+        if configuration.isPressed { return 0.16 }
+        if isHovered { return 0.08 }
+        return 0.0
+    }
+
+    var body: some View {
+        configuration.label
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.primary.opacity(backgroundOpacity))
+            )
+            .onHover { hovering in
+                isHovered = hovering
+            }
+            .animation(.easeOut(duration: 0.12), value: isHovered)
+            .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func cmuxFlatSymbolColorRendering() -> some View {
+        if #available(macOS 26.0, *) {
+            self.symbolColorRenderingMode(.flat)
+        } else {
+            self
+        }
+    }
+}
+
 /// View for rendering a browser panel with address bar
 struct BrowserPanelView: View {
     @ObservedObject var panel: BrowserPanel
     let isFocused: Bool
     let isVisibleInUI: Bool
+    let portalPriority: Int
     let onRequestPanelFocus: () -> Void
+    @Environment(\.colorScheme) private var colorScheme
     @State private var omnibarState = OmnibarState()
     @State private var addressBarFocused: Bool = false
     @AppStorage(BrowserSearchSettings.searchEngineKey) private var searchEngineRaw = BrowserSearchSettings.defaultSearchEngine.rawValue
     @AppStorage(BrowserSearchSettings.searchSuggestionsEnabledKey) private var searchSuggestionsEnabledStorage = BrowserSearchSettings.defaultSearchSuggestionsEnabled
+    @AppStorage(BrowserDevToolsButtonDebugSettings.iconNameKey) private var devToolsIconNameRaw = BrowserDevToolsButtonDebugSettings.defaultIcon.rawValue
+    @AppStorage(BrowserDevToolsButtonDebugSettings.iconColorKey) private var devToolsIconColorRaw = BrowserDevToolsButtonDebugSettings.defaultColor.rawValue
+    @AppStorage(BrowserThemeSettings.modeKey) private var browserThemeModeRaw = BrowserThemeSettings.defaultMode.rawValue
     @State private var suggestionTask: Task<Void, Never>?
     @State private var isLoadingRemoteSuggestions: Bool = false
     @State private var latestRemoteSuggestionQuery: String = ""
@@ -34,10 +190,17 @@ struct BrowserPanelView: View {
     @State private var omnibarHasMarkedText: Bool = false
     @State private var suppressNextFocusLostRevert: Bool = false
     @State private var focusFlashOpacity: Double = 0.0
-    @State private var focusFlashFadeWorkItem: DispatchWorkItem?
+    @State private var focusFlashAnimationGeneration: Int = 0
     @State private var omnibarPillFrame: CGRect = .zero
     @State private var lastHandledAddressBarFocusRequestId: UUID?
-    private let omnibarPillCornerRadius: CGFloat = 12
+    @State private var isBrowserThemeMenuPresented = false
+    // Keep this below half of the compact omnibar height so it reads as a squircle,
+    // not a capsule.
+    private let omnibarPillCornerRadius: CGFloat = 10
+    private let addressBarButtonSize: CGFloat = 22
+    private let addressBarButtonHitSize: CGFloat = 26
+    private let addressBarVerticalPadding: CGFloat = 4
+    private let devToolsButtonIconSize: CGFloat = 11
 
     private var searchEngine: BrowserSearchEngine {
         BrowserSearchEngine(rawValue: searchEngineRaw) ?? BrowserSearchSettings.defaultSearchEngine
@@ -63,16 +226,39 @@ struct BrowserPanelView: View {
         return searchSuggestionsEnabled
     }
 
+    private var devToolsIconOption: BrowserDevToolsIconOption {
+        BrowserDevToolsIconOption(rawValue: devToolsIconNameRaw) ?? BrowserDevToolsButtonDebugSettings.defaultIcon
+    }
+
+    private var devToolsColorOption: BrowserDevToolsIconColorOption {
+        BrowserDevToolsIconColorOption(rawValue: devToolsIconColorRaw) ?? BrowserDevToolsButtonDebugSettings.defaultColor
+    }
+
+    private var browserThemeMode: BrowserThemeMode {
+        BrowserThemeSettings.mode(for: browserThemeModeRaw)
+    }
+
+    private var browserChromeBackgroundColor: NSColor {
+        switch colorScheme {
+        case .dark:
+            return GhosttyApp.shared.defaultBackgroundColor
+        case .light:
+            return .windowBackgroundColor
+        @unknown default:
+            return .windowBackgroundColor
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             addressBar
             webView
         }
         .overlay {
-            RoundedRectangle(cornerRadius: 10)
+            RoundedRectangle(cornerRadius: FocusFlashPattern.ringCornerRadius)
                 .stroke(Color.accentColor.opacity(focusFlashOpacity), lineWidth: 3)
                 .shadow(color: Color.accentColor.opacity(focusFlashOpacity * 0.35), radius: 10)
-                .padding(6)
+                .padding(FocusFlashPattern.ringInset)
                 .allowsHitTesting(false)
         }
         .overlay(alignment: .topLeading) {
@@ -105,6 +291,13 @@ struct BrowserPanelView: View {
             guard let webView = note.object as? CmuxWebView else { return false }
             return webView === panel?.webView
         }) { _ in
+#if DEBUG
+            dlog(
+                "browser.focus.clickIntent panel=\(panel.id.uuidString.prefix(5)) " +
+                "isFocused=\(isFocused ? 1 : 0) " +
+                "addressFocused=\(addressBarFocused ? 1 : 0)"
+            )
+#endif
             onRequestPanelFocus()
         }
         .onReceive(NotificationCenter.default.publisher(for: .webViewMiddleClickedLink).filter { [weak panel] note in
@@ -119,11 +312,19 @@ struct BrowserPanelView: View {
             UserDefaults.standard.register(defaults: [
                 BrowserSearchSettings.searchEngineKey: BrowserSearchSettings.defaultSearchEngine.rawValue,
                 BrowserSearchSettings.searchSuggestionsEnabledKey: BrowserSearchSettings.defaultSearchSuggestionsEnabled,
+                BrowserThemeSettings.modeKey: BrowserThemeSettings.defaultMode.rawValue,
             ])
+            let resolvedThemeMode = BrowserThemeSettings.mode(defaults: .standard)
+            if browserThemeModeRaw != resolvedThemeMode.rawValue {
+                browserThemeModeRaw = resolvedThemeMode.rawValue
+            }
+            panel.refreshAppearanceDrivenColors()
+            panel.setBrowserThemeMode(browserThemeMode)
             applyPendingAddressBarFocusRequestIfNeeded()
             syncURLFromPanel()
             // If the browser surface is focused but has no URL loaded yet, auto-focus the omnibar.
             autoFocusOmnibarIfBlank()
+            syncWebViewResponderPolicyWithViewState(reason: "onAppear")
             BrowserHistoryStore.shared.loadIfNeeded()
         }
         .onChange(of: panel.focusFlashToken) { _ in
@@ -141,6 +342,16 @@ struct BrowserPanelView: View {
                 addressBarFocused = false
             }
         }
+        .onChange(of: browserThemeModeRaw) { _ in
+            let normalizedMode = BrowserThemeSettings.mode(for: browserThemeModeRaw)
+            if browserThemeModeRaw != normalizedMode.rawValue {
+                browserThemeModeRaw = normalizedMode.rawValue
+            }
+            panel.setBrowserThemeMode(normalizedMode)
+        }
+        .onChange(of: colorScheme) { _ in
+            panel.refreshAppearanceDrivenColors()
+        }
         .onChange(of: panel.pendingAddressBarFocusRequestId) { _ in
             applyPendingAddressBarFocusRequestIfNeeded()
         }
@@ -153,6 +364,7 @@ struct BrowserPanelView: View {
                 hideSuggestions()
                 addressBarFocused = false
             }
+            syncWebViewResponderPolicyWithViewState(reason: "panelFocusChanged")
         }
         .onChange(of: addressBarFocused) { focused in
             let urlString = panel.preferredURLStringForOmnibar() ?? ""
@@ -180,6 +392,7 @@ struct BrowserPanelView: View {
                 }
                 inlineCompletion = nil
             }
+            syncWebViewResponderPolicyWithViewState(reason: "addressBarFocusChanged")
         }
         .onReceive(NotificationCenter.default.publisher(for: .browserMoveOmnibarSelection)) { notification in
             guard let panelId = notification.object as? UUID, panelId == panel.id else { return }
@@ -210,17 +423,20 @@ struct BrowserPanelView: View {
             omnibarField
                 .accessibilityIdentifier("BrowserOmnibarPill")
                 .accessibilityLabel("Browser omnibar")
+
+            if !panel.isShowingNewTabPage {
+                browserThemeModeButton
+                developerToolsButton
+            }
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .padding(.vertical, addressBarVerticalPadding)
+        .background(Color(nsColor: browserChromeBackgroundColor))
         // Keep the omnibar stack above WKWebView so the suggestions popup is visible.
         .zIndex(1)
     }
 
     private var addressBarButtonBar: some View {
-        let navButtonSize: CGFloat = 22
-
         return HStack(spacing: 0) {
             Button(action: {
                 #if DEBUG
@@ -230,10 +446,10 @@ struct BrowserPanelView: View {
             }) {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 12, weight: .medium))
-                    .frame(width: navButtonSize, height: navButtonSize, alignment: .center)
+                    .frame(width: addressBarButtonHitSize, height: addressBarButtonHitSize, alignment: .center)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .frame(width: navButtonSize, height: navButtonSize, alignment: .center)
+            .buttonStyle(OmnibarAddressButtonStyle())
             .disabled(!panel.canGoBack)
             .opacity(panel.canGoBack ? 1.0 : 0.4)
             .help("Go Back")
@@ -246,10 +462,10 @@ struct BrowserPanelView: View {
             }) {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 12, weight: .medium))
-                    .frame(width: navButtonSize, height: navButtonSize, alignment: .center)
+                    .frame(width: addressBarButtonHitSize, height: addressBarButtonHitSize, alignment: .center)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .frame(width: navButtonSize, height: navButtonSize, alignment: .center)
+            .buttonStyle(OmnibarAddressButtonStyle())
             .disabled(!panel.canGoForward)
             .opacity(panel.canGoForward ? 1.0 : 0.4)
             .help("Go Forward")
@@ -269,12 +485,97 @@ struct BrowserPanelView: View {
             }) {
                 Image(systemName: panel.isLoading ? "xmark" : "arrow.clockwise")
                     .font(.system(size: 12, weight: .medium))
-                    .frame(width: navButtonSize, height: navButtonSize, alignment: .center)
+                    .frame(width: addressBarButtonHitSize, height: addressBarButtonHitSize, alignment: .center)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .frame(width: navButtonSize, height: navButtonSize, alignment: .center)
+            .buttonStyle(OmnibarAddressButtonStyle())
             .help(panel.isLoading ? "Stop" : "Reload")
+
+            if panel.isDownloading {
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Downloading...")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.leading, 6)
+                .help("Download in progress")
+            }
         }
+    }
+
+    private var developerToolsButton: some View {
+        Button(action: {
+            openDevTools()
+        }) {
+            Image(systemName: devToolsIconOption.rawValue)
+                .symbolRenderingMode(.monochrome)
+                .cmuxFlatSymbolColorRendering()
+                .font(.system(size: devToolsButtonIconSize, weight: .medium))
+                .foregroundStyle(devToolsColorOption.color)
+                .frame(width: addressBarButtonSize, height: addressBarButtonSize, alignment: .center)
+        }
+        .buttonStyle(OmnibarAddressButtonStyle())
+        .frame(width: addressBarButtonSize, height: addressBarButtonSize, alignment: .center)
+        .help(KeyboardShortcutSettings.Action.toggleBrowserDeveloperTools.tooltip("Toggle Developer Tools"))
+        .accessibilityIdentifier("BrowserToggleDevToolsButton")
+    }
+
+    private var browserThemeModeButton: some View {
+        Button(action: {
+            isBrowserThemeMenuPresented.toggle()
+        }) {
+            Image(systemName: browserThemeMode.iconName)
+                .symbolRenderingMode(.monochrome)
+                .cmuxFlatSymbolColorRendering()
+                .font(.system(size: devToolsButtonIconSize, weight: .medium))
+                .foregroundStyle(browserThemeModeIconColor)
+                .frame(width: addressBarButtonSize, height: addressBarButtonSize, alignment: .center)
+        }
+        .buttonStyle(OmnibarAddressButtonStyle())
+        .frame(width: addressBarButtonSize, height: addressBarButtonSize, alignment: .center)
+        .popover(isPresented: $isBrowserThemeMenuPresented, arrowEdge: .bottom) {
+            browserThemeModePopover
+        }
+        .help("Browser Theme: \(browserThemeMode.displayName)")
+        .accessibilityIdentifier("BrowserThemeModeButton")
+    }
+
+    private var browserThemeModePopover: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(BrowserThemeMode.allCases) { mode in
+                Button {
+                    applyBrowserThemeModeSelection(mode)
+                    isBrowserThemeMenuPresented = false
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: mode == browserThemeMode ? "checkmark" : "circle")
+                            .font(.system(size: 10, weight: .semibold))
+                            .opacity(mode == browserThemeMode ? 1.0 : 0.0)
+                            .frame(width: 12, alignment: .center)
+                        Text(mode.displayName)
+                            .font(.system(size: 12))
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .contentShape(Rectangle())
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(mode == browserThemeMode ? Color.primary.opacity(0.12) : Color.clear)
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("BrowserThemeModeOption\(mode.rawValue.capitalized)")
+            }
+        }
+        .padding(8)
+        .frame(minWidth: 128)
+    }
+
+    private var browserThemeModeIconColor: Color {
+        devToolsColorOption.color
     }
 
     private var omnibarField: some View {
@@ -366,47 +667,77 @@ struct BrowserPanelView: View {
     }
 
     private var webView: some View {
-        WebViewRepresentable(
-            panel: panel,
-            shouldAttachWebView: isVisibleInUI,
-            shouldFocusWebView: isFocused && !addressBarFocused,
-            isPanelFocused: isFocused
-        )
-            // Keep the representable identity stable across bonsplit structural updates.
-            // This reduces WKWebView reparenting churn (and the associated WebKit crashes).
-            .id(panel.id)
-            .contentShape(Rectangle())
-            .simultaneousGesture(TapGesture().onEnded {
-                // Chrome-like behavior: clicking web content while editing the
-                // omnibar should commit blur and revert transient edits.
-                if addressBarFocused {
-                    addressBarFocused = false
-                }
-            })
-            .zIndex(0)
-            .contextMenu {
-                Button("Open Developer Tools") {
-                    openDevTools()
-                }
-                .keyboardShortcut("i", modifiers: [.command, .option])
+        Group {
+            if panel.shouldRenderWebView {
+                WebViewRepresentable(
+                    panel: panel,
+                    shouldAttachWebView: isVisibleInUI,
+                    shouldFocusWebView: isFocused && !addressBarFocused,
+                    isPanelFocused: isFocused,
+                    portalZPriority: portalPriority
+                )
+                // Keep the representable identity stable across bonsplit structural updates.
+                // This reduces WKWebView reparenting churn (and the associated WebKit crashes).
+                .id(panel.id)
+                .contentShape(Rectangle())
+                .simultaneousGesture(TapGesture().onEnded {
+                    // Chrome-like behavior: clicking web content while editing the
+                    // omnibar should commit blur and revert transient edits.
+                    if addressBarFocused {
+                        addressBarFocused = false
+                    }
+                })
+            } else {
+                Color(nsColor: browserChromeBackgroundColor)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        onRequestPanelFocus()
+                        if addressBarFocused {
+                            addressBarFocused = false
+                        }
+                    }
             }
+        }
+        .zIndex(0)
     }
 
     private func triggerFocusFlashAnimation() {
-        focusFlashFadeWorkItem?.cancel()
-        focusFlashFadeWorkItem = nil
+        focusFlashAnimationGeneration &+= 1
+        let generation = focusFlashAnimationGeneration
+        focusFlashOpacity = FocusFlashPattern.values.first ?? 0
 
-        withAnimation(.easeOut(duration: 0.08)) {
-            focusFlashOpacity = 1.0
-        }
-
-        let item = DispatchWorkItem {
-            withAnimation(.easeOut(duration: 0.35)) {
-                focusFlashOpacity = 0.0
+        for segment in FocusFlashPattern.segments {
+            DispatchQueue.main.asyncAfter(deadline: .now() + segment.delay) {
+                guard focusFlashAnimationGeneration == generation else { return }
+                withAnimation(focusFlashAnimation(for: segment.curve, duration: segment.duration)) {
+                    focusFlashOpacity = segment.targetOpacity
+                }
             }
         }
-        focusFlashFadeWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: item)
+    }
+
+    private func focusFlashAnimation(for curve: FocusFlashCurve, duration: TimeInterval) -> Animation {
+        switch curve {
+        case .easeIn:
+            return .easeIn(duration: duration)
+        case .easeOut:
+            return .easeOut(duration: duration)
+        }
+    }
+
+    private func syncWebViewResponderPolicyWithViewState(reason: String) {
+        guard let cmuxWebView = panel.webView as? CmuxWebView else { return }
+        let next = isFocused && !panel.shouldSuppressWebViewFocus()
+        if cmuxWebView.allowsFirstResponderAcquisition != next {
+#if DEBUG
+            dlog(
+                "browser.focus.policy.resync panel=\(panel.id.uuidString.prefix(5)) " +
+                "web=\(ObjectIdentifier(cmuxWebView)) old=\(cmuxWebView.allowsFirstResponderAcquisition ? 1 : 0) " +
+                "new=\(next ? 1 : 0) reason=\(reason)"
+            )
+#endif
+        }
+        cmuxWebView.allowsFirstResponderAcquisition = next
     }
 
     private func syncURLFromPanel() {
@@ -453,11 +784,19 @@ struct BrowserPanelView: View {
     }
 
     private func openDevTools() {
-        // WKWebView with developerExtrasEnabled allows right-click > Inspect Element
-        // We can also trigger via JavaScript
-        Task {
-            try? await panel.evaluateJavaScript("window.webkit?.messageHandlers?.devTools?.postMessage('open')")
+        #if DEBUG
+        dlog("browser.toggleDevTools panel=\(panel.id.uuidString.prefix(5))")
+        #endif
+        if !panel.toggleDeveloperTools() {
+            NSSound.beep()
         }
+    }
+
+    private func applyBrowserThemeModeSelection(_ mode: BrowserThemeMode) {
+        if browserThemeModeRaw != mode.rawValue {
+            browserThemeModeRaw = mode.rawValue
+        }
+        panel.setBrowserThemeMode(mode)
     }
 
     private func handleOmnibarTap() {
@@ -1071,7 +1410,19 @@ func buildOmnibarSuggestions(
         )
         order += 1
         if let existing = bestByCompletion[key] {
-            if ranked.score > existing.score {
+            let shouldReplaceExisting: Bool = {
+                // For identical completions, keep "go to URL" over "switch to tab" so
+                // pressing Enter performs navigation unless the user explicitly picks a tab row.
+                switch (existing.suggestion.kind, ranked.suggestion.kind) {
+                case (.navigate, .switchToTab):
+                    return false
+                case (.switchToTab, .navigate):
+                    return true
+                default:
+                    return ranked.score > existing.score
+                }
+            }()
+            if shouldReplaceExisting {
                 bestByCompletion[key] = ranked
             }
         } else {
@@ -1970,6 +2321,8 @@ private struct OmnibarTextFieldRepresentable: NSViewRepresentable {
                 parent.onMoveSelection(-1)
                 return true
             case #selector(NSResponder.insertNewline(_:)):
+                let currentFlags = NSApp.currentEvent?.modifierFlags ?? []
+                guard browserOmnibarShouldSubmitOnReturn(flags: currentFlags) else { return false }
                 parent.onSubmit()
                 return true
             case #selector(NSResponder.cancelOperation(_:)):
@@ -2080,6 +2433,7 @@ private struct OmnibarTextFieldRepresentable: NSViewRepresentable {
 
             switch keyCode {
             case 36, 76: // Return / keypad Enter
+                guard browserOmnibarShouldSubmitOnReturn(flags: event.modifierFlags) else { return false }
                 parent.onSubmit()
                 return true
             case 53: // Escape
@@ -2431,14 +2785,108 @@ struct WebViewRepresentable: NSViewRepresentable {
     let shouldAttachWebView: Bool
     let shouldFocusWebView: Bool
     let isPanelFocused: Bool
+    let portalZPriority: Int
 
     final class Coordinator {
+        weak var panel: BrowserPanel?
         weak var webView: WKWebView?
-        var constraints: [NSLayoutConstraint] = []
         var attachRetryWorkItem: DispatchWorkItem?
         var attachRetryCount: Int = 0
         var attachGeneration: Int = 0
+        var usesWindowPortal: Bool = false
+        var desiredPortalVisibleInUI: Bool = true
+        var desiredPortalZPriority: Int = 0
+        var lastPortalHostId: ObjectIdentifier?
     }
+
+    private final class HostContainerView: NSView {
+        var onDidMoveToWindow: (() -> Void)?
+        var onGeometryChanged: (() -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            onDidMoveToWindow?()
+            onGeometryChanged?()
+        }
+
+        override func viewDidMoveToSuperview() {
+            super.viewDidMoveToSuperview()
+            onGeometryChanged?()
+        }
+
+        override func layout() {
+            super.layout()
+            onGeometryChanged?()
+        }
+
+        override func setFrameOrigin(_ newOrigin: NSPoint) {
+            super.setFrameOrigin(newOrigin)
+            onGeometryChanged?()
+        }
+
+        override func setFrameSize(_ newSize: NSSize) {
+            super.setFrameSize(newSize)
+            onGeometryChanged?()
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            if shouldPassThroughToSidebarResizer(at: point) {
+                return nil
+            }
+            return super.hitTest(point)
+        }
+
+        private func shouldPassThroughToSidebarResizer(at point: NSPoint) -> Bool {
+            // Pass through a narrow leading-edge band so the shared sidebar divider
+            // handle can receive hover/click even when WKWebView is attached here.
+            // Keeping this deterministic avoids flicker from dynamic left-edge scans.
+            guard point.x >= 0, point.x <= SidebarResizeInteraction.hitWidthPerSide else {
+                return false
+            }
+            guard let window, let contentView = window.contentView else {
+                return false
+            }
+            let hostRectInContent = contentView.convert(bounds, from: self)
+            return hostRectInContent.minX > 1
+        }
+    }
+
+    #if DEBUG
+    private static func logDevToolsState(
+        _ panel: BrowserPanel,
+        event: String,
+        generation: Int,
+        retryCount: Int,
+        details: String? = nil
+    ) {
+        var line = "browser.devtools event=\(event) panel=\(panel.id.uuidString.prefix(5)) generation=\(generation) retry=\(retryCount) \(panel.debugDeveloperToolsStateSummary())"
+        if let details, !details.isEmpty {
+            line += " \(details)"
+        }
+        dlog(line)
+    }
+
+    private static func objectID(_ object: AnyObject?) -> String {
+        guard let object else { return "nil" }
+        return String(describing: Unmanaged.passUnretained(object).toOpaque())
+    }
+
+    private static func responderDescription(_ responder: NSResponder?) -> String {
+        guard let responder else { return "nil" }
+        return "\(type(of: responder))@\(objectID(responder))"
+    }
+
+    private static func rectDescription(_ rect: NSRect) -> String {
+        String(format: "%.1f,%.1f %.1fx%.1f", rect.origin.x, rect.origin.y, rect.size.width, rect.size.height)
+    }
+
+    private static func attachContext(webView: WKWebView, host: NSView) -> String {
+        let hostWindow = host.window?.windowNumber ?? -1
+        let webWindow = webView.window?.windowNumber ?? -1
+        let firstResponder = (webView.window ?? host.window)?.firstResponder
+        return "host=\(objectID(host)) hostWin=\(hostWindow) hostInWin=\(host.window == nil ? 0 : 1) hostFrame=\(rectDescription(host.frame)) hostBounds=\(rectDescription(host.bounds)) oldSuper=\(objectID(webView.superview)) webWin=\(webWindow) webInWin=\(webView.window == nil ? 0 : 1) webFrame=\(rectDescription(webView.frame)) webHidden=\(webView.isHidden ? 1 : 0) fr=\(responderDescription(firstResponder))"
+    }
+    #endif
 
     private static func responderChainContains(_ start: NSResponder?, target: NSResponder) -> Bool {
         var r = start
@@ -2451,22 +2899,150 @@ struct WebViewRepresentable: NSViewRepresentable {
         return false
     }
 
+    private static func isLikelyInspectorResponder(_ responder: NSResponder?) -> Bool {
+        guard let responder else { return false }
+        let responderType = String(describing: type(of: responder))
+        if responderType.contains("WKInspector") {
+            return true
+        }
+        guard let view = responder as? NSView else { return false }
+        var node: NSView? = view
+        var hops = 0
+        while let current = node, hops < 64 {
+            if String(describing: type(of: current)).contains("WKInspector") {
+                return true
+            }
+            node = current.superview
+            hops += 1
+        }
+        return false
+    }
+
+    private static func firstResponderResignState(
+        _ responder: NSResponder?,
+        webView: WKWebView
+    ) -> (needsResign: Bool, flags: String) {
+        let inWebViewChain = responderChainContains(responder, target: webView)
+        let inspectorResponder = isLikelyInspectorResponder(responder)
+        let needsResign = inWebViewChain || inspectorResponder
+        return (
+            needsResign: needsResign,
+            flags: "frInWebChain=\(inWebViewChain ? 1 : 0) frIsInspector=\(inspectorResponder ? 1 : 0)"
+        )
+    }
+
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        let coordinator = Coordinator()
+        coordinator.panel = panel
+        return coordinator
     }
 
     func makeNSView(context: Context) -> NSView {
-        let container = NSView()
+        let container = HostContainerView()
         container.wantsLayer = true
         return container
     }
 
-    private static func attachWebView(_ webView: WKWebView, to host: NSView, coordinator: Coordinator) {
+    private static func clearPortalCallbacks(for host: NSView) {
+        guard let host = host as? HostContainerView else { return }
+        host.onDidMoveToWindow = nil
+        host.onGeometryChanged = nil
+    }
+
+    private func updateUsingWindowPortal(_ nsView: NSView, context: Context, webView: WKWebView) {
+        guard let host = nsView as? HostContainerView else { return }
+
+        let coordinator = context.coordinator
+        let previousVisible = coordinator.desiredPortalVisibleInUI
+        let previousZPriority = coordinator.desiredPortalZPriority
+        coordinator.desiredPortalVisibleInUI = shouldAttachWebView
+        coordinator.desiredPortalZPriority = portalZPriority
+        coordinator.attachGeneration += 1
+        let generation = coordinator.attachGeneration
+
+        host.onDidMoveToWindow = { [weak host, weak webView, weak coordinator] in
+            guard let host, let webView, let coordinator else { return }
+            guard coordinator.attachGeneration == generation else { return }
+            guard host.window != nil else { return }
+            BrowserWindowPortalRegistry.bind(
+                webView: webView,
+                to: host,
+                visibleInUI: coordinator.desiredPortalVisibleInUI,
+                zPriority: coordinator.desiredPortalZPriority
+            )
+            coordinator.lastPortalHostId = ObjectIdentifier(host)
+        }
+        host.onGeometryChanged = { [weak host, weak coordinator] in
+            guard let host, let coordinator else { return }
+            guard coordinator.attachGeneration == generation else { return }
+            guard coordinator.lastPortalHostId == ObjectIdentifier(host) else { return }
+            BrowserWindowPortalRegistry.synchronizeForAnchor(host)
+        }
+
+        if !shouldAttachWebView {
+            // In portal mode we no longer detach/re-attach to preserve DevTools state.
+            // Sync the inspector preference directly so manual closes are respected.
+            panel.syncDeveloperToolsPreferenceFromInspector()
+        }
+
+        if host.window != nil {
+            let hostId = ObjectIdentifier(host)
+            let shouldBindNow =
+                coordinator.lastPortalHostId != hostId ||
+                webView.superview == nil ||
+                previousVisible != shouldAttachWebView ||
+                previousZPriority != portalZPriority
+            if shouldBindNow {
+                BrowserWindowPortalRegistry.bind(
+                    webView: webView,
+                    to: host,
+                    visibleInUI: coordinator.desiredPortalVisibleInUI,
+                    zPriority: coordinator.desiredPortalZPriority
+                )
+                coordinator.lastPortalHostId = hostId
+            }
+            BrowserWindowPortalRegistry.synchronizeForAnchor(host)
+        } else {
+            // Bind is deferred until host moves into a window. Keep the current
+            // portal entry's desired state in sync so stale callbacks cannot keep
+            // the previous anchor visible while this host is temporarily off-window.
+            BrowserWindowPortalRegistry.updateEntryVisibility(
+                for: webView,
+                visibleInUI: coordinator.desiredPortalVisibleInUI,
+                zPriority: coordinator.desiredPortalZPriority
+            )
+        }
+
+        panel.restoreDeveloperToolsAfterAttachIfNeeded()
+
+        #if DEBUG
+        Self.logDevToolsState(
+            panel,
+            event: "portal.update",
+            generation: coordinator.attachGeneration,
+            retryCount: coordinator.attachRetryCount,
+            details: Self.attachContext(webView: webView, host: host)
+        )
+        #endif
+    }
+
+    private static func attachWebView(_ webView: WKWebView, to host: NSView) {
         // WebKit can crash if a WKWebView (or an internal first-responder object) stays first responder
         // while being detached/reparented during bonsplit/SwiftUI structural updates.
-        if let window = webView.window,
-           responderChainContains(window.firstResponder, target: webView) {
-            window.makeFirstResponder(nil)
+        if let window = webView.window {
+            let state = firstResponderResignState(window.firstResponder, webView: webView)
+            if state.needsResign {
+                window.makeFirstResponder(nil)
+            }
+        }
+
+        // The target host can already be in-window while the source host is tearing down.
+        // Re-check against the target window too (it can differ during split churn).
+        if let window = host.window {
+            let state = firstResponderResignState(window.firstResponder, webView: webView)
+            if state.needsResign {
+                window.makeFirstResponder(nil)
+            }
         }
 
         // Detach from any previous host (bonsplit/SwiftUI may rearrange views).
@@ -2474,15 +3050,11 @@ struct WebViewRepresentable: NSViewRepresentable {
         host.subviews.forEach { $0.removeFromSuperview() }
         host.addSubview(webView)
 
-        webView.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.deactivate(coordinator.constraints)
-        coordinator.constraints = [
-            webView.leadingAnchor.constraint(equalTo: host.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: host.trailingAnchor),
-            webView.topAnchor.constraint(equalTo: host.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: host.bottomAnchor),
-        ]
-        NSLayoutConstraint.activate(coordinator.constraints)
+        // Work around WebKit bug 272474 where Inspect Element can render blank/flicker
+        // when WKWebView is edge-pinned using Auto Layout constraints.
+        webView.translatesAutoresizingMaskIntoConstraints = true
+        webView.autoresizingMask = [.width, .height]
+        webView.frame = host.bounds
 
         // Make reparenting resilient: WebKit can occasionally stay visually blank until forced to lay out.
         webView.needsLayout = true
@@ -2491,7 +3063,13 @@ struct WebViewRepresentable: NSViewRepresentable {
         webView.displayIfNeeded()
     }
 
-    private static func scheduleAttachRetry(_ webView: WKWebView, to host: NSView, coordinator: Coordinator, generation: Int) {
+    private static func scheduleAttachRetry(
+        _ webView: WKWebView,
+        panel: BrowserPanel,
+        to host: NSView,
+        coordinator: Coordinator,
+        generation: Int
+    ) {
         // Don't schedule multiple overlapping retries.
         guard coordinator.attachRetryWorkItem == nil else { return }
 
@@ -2510,18 +3088,54 @@ struct WebViewRepresentable: NSViewRepresentable {
             // is in a window during bonsplit tree updates; moving the webview too early can be flaky.
             guard host.window != nil else {
                 coordinator.attachRetryCount += 1
+                #if DEBUG
+                if coordinator.attachRetryCount == 1 || coordinator.attachRetryCount % 20 == 0 {
+                    logDevToolsState(
+                        panel,
+                        event: "retry.waitingForWindow",
+                        generation: generation,
+                        retryCount: coordinator.attachRetryCount,
+                        details: attachContext(webView: webView, host: host)
+                    )
+                }
+                #endif
                 // Be generous here: bonsplit structural updates can keep a representable
                 // container off-window longer than a few seconds under load.
                 if coordinator.attachRetryCount < 400 {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        scheduleAttachRetry(webView, to: host, coordinator: coordinator, generation: generation)
+                        scheduleAttachRetry(
+                            webView,
+                            panel: panel,
+                            to: host,
+                            coordinator: coordinator,
+                            generation: generation
+                        )
                     }
                 }
                 return
             }
 
             coordinator.attachRetryCount = 0
-            attachWebView(webView, to: host, coordinator: coordinator)
+            #if DEBUG
+            logDevToolsState(
+                panel,
+                event: "retry.attach.begin",
+                generation: generation,
+                retryCount: 0,
+                details: attachContext(webView: webView, host: host)
+            )
+            #endif
+            attachWebView(webView, to: host)
+            panel.restoreDeveloperToolsAfterAttachIfNeeded()
+            #if DEBUG
+            logDevToolsState(
+                panel,
+                event: "retry.attached",
+                generation: generation,
+                retryCount: 0,
+                details: attachContext(webView: webView, host: host)
+            )
+            #endif
         }
 
         coordinator.attachRetryWorkItem = work
@@ -2530,30 +3144,111 @@ struct WebViewRepresentable: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         let webView = panel.webView
+        context.coordinator.panel = panel
         context.coordinator.webView = webView
+        Self.applyWebViewFirstResponderPolicy(
+            panel: panel,
+            webView: webView,
+            isPanelFocused: isPanelFocused
+        )
+
+        let shouldUseWindowPortal = panel.shouldPreserveWebViewAttachmentDuringTransientHide()
+        if shouldUseWindowPortal {
+            context.coordinator.usesWindowPortal = true
+            Self.clearPortalCallbacks(for: nsView)
+            updateUsingWindowPortal(nsView, context: context, webView: webView)
+            Self.applyFocus(
+                panel: panel,
+                webView: webView,
+                nsView: nsView,
+                shouldFocusWebView: shouldFocusWebView,
+                isPanelFocused: isPanelFocused
+            )
+            return
+        }
+
+        if context.coordinator.usesWindowPortal {
+            BrowserWindowPortalRegistry.detach(webView: webView)
+            context.coordinator.usesWindowPortal = false
+            context.coordinator.lastPortalHostId = nil
+        }
+        Self.clearPortalCallbacks(for: nsView)
 
         // Bonsplit keepAllAlive keeps hidden tabs alive (opacity 0). WKWebView is fragile when left
         // in the window hierarchy while hidden and rapidly switching focus between tabs. To reduce
         // WebKit crashes, detach the WKWebView when this surface is not the selected tab in its pane.
         if !shouldAttachWebView {
+            // Split/layout churn can briefly create an off-window phase while DevTools is open.
+            // Detaching here can blank inspector content even when visibility preference stays true.
+            if nsView.window == nil,
+               webView.superview != nil,
+               panel.shouldPreserveWebViewAttachmentDuringTransientHide() {
+                #if DEBUG
+                Self.logDevToolsState(
+                    panel,
+                    event: "detach.skipped.offWindowDevTools",
+                    generation: context.coordinator.attachGeneration,
+                    retryCount: context.coordinator.attachRetryCount,
+                    details: Self.attachContext(webView: webView, host: nsView)
+                )
+                #endif
+                return
+            }
+
+            #if DEBUG
+            Self.logDevToolsState(
+                panel,
+                event: "detach.beforeSync",
+                generation: context.coordinator.attachGeneration,
+                retryCount: context.coordinator.attachRetryCount,
+                details: Self.attachContext(webView: webView, host: nsView)
+            )
+            #endif
+            panel.syncDeveloperToolsPreferenceFromInspector(preserveVisibleIntent: true)
+            #if DEBUG
+            Self.logDevToolsState(
+                panel,
+                event: "detach.afterSync",
+                generation: context.coordinator.attachGeneration,
+                retryCount: context.coordinator.attachRetryCount,
+                details: Self.attachContext(webView: webView, host: nsView)
+            )
+            #endif
             context.coordinator.attachRetryWorkItem?.cancel()
             context.coordinator.attachRetryWorkItem = nil
             context.coordinator.attachRetryCount = 0
             context.coordinator.attachGeneration += 1
 
             // Resign focus if WebKit currently owns first responder.
-            if let window = webView.window,
-               Self.responderChainContains(window.firstResponder, target: webView) {
-                window.makeFirstResponder(nil)
+            if let window = webView.window ?? nsView.window {
+                let state = Self.firstResponderResignState(window.firstResponder, webView: webView)
+                if state.needsResign {
+                    #if DEBUG
+                    Self.logDevToolsState(
+                        panel,
+                        event: "detach.resignFirstResponder",
+                        generation: context.coordinator.attachGeneration,
+                        retryCount: context.coordinator.attachRetryCount,
+                        details: Self.attachContext(webView: webView, host: nsView) + " " + state.flags
+                    )
+                    #endif
+                    window.makeFirstResponder(nil)
+                }
             }
-
-            NSLayoutConstraint.deactivate(context.coordinator.constraints)
-            context.coordinator.constraints.removeAll()
 
             if webView.superview != nil {
                 webView.removeFromSuperview()
             }
             nsView.subviews.forEach { $0.removeFromSuperview() }
+            #if DEBUG
+            Self.logDevToolsState(
+                panel,
+                event: "detach.done",
+                generation: context.coordinator.attachGeneration,
+                retryCount: context.coordinator.attachRetryCount,
+                details: Self.attachContext(webView: webView, host: nsView)
+            )
+            #endif
             return
         }
 
@@ -2563,17 +3258,83 @@ struct WebViewRepresentable: NSViewRepresentable {
             context.coordinator.attachRetryWorkItem = nil
             context.coordinator.attachGeneration += 1
 
+            if let window = webView.window ?? nsView.window {
+                let state = Self.firstResponderResignState(window.firstResponder, webView: webView)
+                if state.needsResign {
+                    #if DEBUG
+                    Self.logDevToolsState(
+                        panel,
+                        event: "attach.reparent.resignFirstResponder.begin",
+                        generation: context.coordinator.attachGeneration,
+                        retryCount: context.coordinator.attachRetryCount,
+                        details: Self.attachContext(webView: webView, host: nsView) + " " + state.flags
+                    )
+                    #endif
+                    let resigned = window.makeFirstResponder(nil)
+                    #if DEBUG
+                    Self.logDevToolsState(
+                        panel,
+                        event: "attach.reparent.resignFirstResponder.end",
+                        generation: context.coordinator.attachGeneration,
+                        retryCount: context.coordinator.attachRetryCount,
+                        details: Self.attachContext(webView: webView, host: nsView) + " " + state.flags + " resigned=\(resigned ? 1 : 0)"
+                    )
+                    #endif
+                }
+            }
+
             if nsView.window == nil {
                 // Avoid attaching to off-window containers; during bonsplit structural updates SwiftUI
                 // can create containers that are never inserted into the window.
+                if panel.shouldPreserveWebViewAttachmentDuringTransientHide() {
+                    panel.requestDeveloperToolsRefreshAfterNextAttach(reason: "attach.defer.offWindow")
+                    #if DEBUG
+                    Self.logDevToolsState(
+                        panel,
+                        event: "attach.defer.requestRefresh",
+                        generation: context.coordinator.attachGeneration,
+                        retryCount: context.coordinator.attachRetryCount,
+                        details: Self.attachContext(webView: webView, host: nsView)
+                    )
+                    #endif
+                }
+                #if DEBUG
+                Self.logDevToolsState(
+                    panel,
+                    event: "attach.defer.offWindow",
+                    generation: context.coordinator.attachGeneration,
+                    retryCount: context.coordinator.attachRetryCount,
+                    details: Self.attachContext(webView: webView, host: nsView)
+                )
+                #endif
                 Self.scheduleAttachRetry(
                     webView,
+                    panel: panel,
                     to: nsView,
                     coordinator: context.coordinator,
                     generation: context.coordinator.attachGeneration
                 )
             } else {
-                Self.attachWebView(webView, to: nsView, coordinator: context.coordinator)
+                #if DEBUG
+                Self.logDevToolsState(
+                    panel,
+                    event: "attach.immediate.begin",
+                    generation: context.coordinator.attachGeneration,
+                    retryCount: context.coordinator.attachRetryCount,
+                    details: Self.attachContext(webView: webView, host: nsView)
+                )
+                #endif
+                Self.attachWebView(webView, to: nsView)
+                panel.restoreDeveloperToolsAfterAttachIfNeeded()
+                #if DEBUG
+                Self.logDevToolsState(
+                    panel,
+                    event: "attach.immediate",
+                    generation: context.coordinator.attachGeneration,
+                    retryCount: context.coordinator.attachRetryCount,
+                    details: Self.attachContext(webView: webView, host: nsView)
+                )
+                #endif
             }
         } else {
             // Already attached; no need for any pending retry.
@@ -2581,26 +3342,80 @@ struct WebViewRepresentable: NSViewRepresentable {
             context.coordinator.attachRetryWorkItem = nil
             context.coordinator.attachRetryCount = 0
             context.coordinator.attachGeneration += 1
+            let hadPendingRefresh = panel.hasPendingDeveloperToolsRefreshAfterAttach()
+            panel.restoreDeveloperToolsAfterAttachIfNeeded()
+            #if DEBUG
+            if hadPendingRefresh {
+                Self.logDevToolsState(
+                    panel,
+                    event: "attach.alreadyAttached.consumePendingRefresh",
+                    generation: context.coordinator.attachGeneration,
+                    retryCount: context.coordinator.attachRetryCount,
+                    details: Self.attachContext(webView: webView, host: nsView)
+                )
+            }
+            Self.logDevToolsState(
+                panel,
+                event: "attach.alreadyAttached",
+                generation: context.coordinator.attachGeneration,
+                retryCount: context.coordinator.attachRetryCount,
+                details: Self.attachContext(webView: webView, host: nsView)
+            )
+            #endif
         }
 
+        Self.applyFocus(
+            panel: panel,
+            webView: webView,
+            nsView: nsView,
+            shouldFocusWebView: shouldFocusWebView,
+            isPanelFocused: isPanelFocused
+        )
+    }
+
+    private static func applyFocus(
+        panel: BrowserPanel,
+        webView: WKWebView,
+        nsView: NSView,
+        shouldFocusWebView: Bool,
+        isPanelFocused: Bool
+    ) {
         // Focus handling. Avoid fighting the address bar when it is focused.
         guard let window = nsView.window else { return }
         if shouldFocusWebView {
             if panel.shouldSuppressWebViewFocus() {
                 return
             }
-            if Self.responderChainContains(window.firstResponder, target: webView) {
+            if responderChainContains(window.firstResponder, target: webView) {
                 return
             }
             window.makeFirstResponder(webView)
-        } else {
+        } else if !isPanelFocused && responderChainContains(window.firstResponder, target: webView) {
             // Only force-resign WebView focus when this panel itself is not focused.
             // If the panel is focused but the omnibar-focus state is briefly stale, aggressively
             // clearing first responder here can undo programmatic webview focus (socket tests).
-            if !isPanelFocused && Self.responderChainContains(window.firstResponder, target: webView) {
-                window.makeFirstResponder(nil)
-            }
+            window.makeFirstResponder(nil)
         }
+    }
+
+    private static func applyWebViewFirstResponderPolicy(
+        panel: BrowserPanel,
+        webView: WKWebView,
+        isPanelFocused: Bool
+    ) {
+        guard let cmuxWebView = webView as? CmuxWebView else { return }
+        let next = isPanelFocused && !panel.shouldSuppressWebViewFocus()
+        if cmuxWebView.allowsFirstResponderAcquisition != next {
+#if DEBUG
+            dlog(
+                "browser.focus.policy panel=\(panel.id.uuidString.prefix(5)) " +
+                "web=\(ObjectIdentifier(cmuxWebView)) old=\(cmuxWebView.allowsFirstResponderAcquisition ? 1 : 0) " +
+                "new=\(next ? 1 : 0) isPanelFocused=\(isPanelFocused ? 1 : 0) " +
+                "suppress=\(panel.shouldSuppressWebViewFocus() ? 1 : 0)"
+            )
+#endif
+        }
+        cmuxWebView.allowsFirstResponderAcquisition = next
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
@@ -2608,20 +3423,85 @@ struct WebViewRepresentable: NSViewRepresentable {
         coordinator.attachRetryWorkItem = nil
         coordinator.attachRetryCount = 0
         coordinator.attachGeneration += 1
-
-        NSLayoutConstraint.deactivate(coordinator.constraints)
-        coordinator.constraints.removeAll()
+        clearPortalCallbacks(for: nsView)
 
         guard let webView = coordinator.webView else { return }
+        let panel = coordinator.panel
+
+        if coordinator.usesWindowPortal {
+            coordinator.usesWindowPortal = false
+            coordinator.lastPortalHostId = nil
+
+            // During split/layout churn we keep the WKWebView portal-hosted so DevTools
+            // does not lose state. BrowserPanel deinit explicitly detaches on real teardown.
+            if let panel, panel.shouldPreserveWebViewAttachmentDuringTransientHide() {
+                #if DEBUG
+                logDevToolsState(
+                    panel,
+                    event: "dismantle.portal.keepAttached",
+                    generation: coordinator.attachGeneration,
+                    retryCount: coordinator.attachRetryCount,
+                    details: attachContext(webView: webView, host: nsView)
+                )
+                #endif
+                return
+            }
+
+            BrowserWindowPortalRegistry.detach(webView: webView)
+            return
+        }
 
         // If we're being torn down while the WKWebView (or one of its subviews) is first responder,
         // resign it before detaching.
         let window = webView.window ?? nsView.window
-        if let window, responderChainContains(window.firstResponder, target: webView) {
-            window.makeFirstResponder(nil)
+        if let window {
+            let state = firstResponderResignState(window.firstResponder, webView: webView)
+            if state.needsResign {
+                #if DEBUG
+                if let panel {
+                    logDevToolsState(
+                        panel,
+                        event: "dismantle.resignFirstResponder",
+                        generation: coordinator.attachGeneration,
+                        retryCount: coordinator.attachRetryCount,
+                        details: attachContext(webView: webView, host: nsView) + " " + state.flags
+                    )
+                }
+                #endif
+                window.makeFirstResponder(nil)
+            }
         }
+
+        // During split/layout churn, SwiftUI may tear down a host view while a new one is still
+        // coming online. When DevTools is intended open, avoid eagerly detaching here.
+        if let panel,
+           panel.shouldPreserveWebViewAttachmentDuringTransientHide(),
+           webView.superview === nsView {
+            #if DEBUG
+            logDevToolsState(
+                panel,
+                event: "dismantle.skipDetach.devTools",
+                generation: coordinator.attachGeneration,
+                retryCount: coordinator.attachRetryCount,
+                details: attachContext(webView: webView, host: nsView)
+            )
+            #endif
+            return
+        }
+
         if webView.superview === nsView {
             webView.removeFromSuperview()
+            #if DEBUG
+            if let panel {
+                logDevToolsState(
+                    panel,
+                    event: "dismantle.detached",
+                    generation: coordinator.attachGeneration,
+                    retryCount: coordinator.attachRetryCount,
+                    details: attachContext(webView: webView, host: nsView)
+                )
+            }
+            #endif
         }
     }
 }

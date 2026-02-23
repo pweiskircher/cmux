@@ -3,6 +3,30 @@ import Bonsplit
 import SwiftUI
 import ObjectiveC
 import UniformTypeIdentifiers
+import WebKit
+
+private extension Color {
+    init?(hex: String) {
+        let hex = hex.trimmingCharacters(in: .init(charactersIn: "#"))
+        guard hex.count == 6, let value = UInt64(hex, radix: 16) else { return nil }
+        self.init(
+            red:   Double((value >> 16) & 0xFF) / 255.0,
+            green: Double((value >> 8)  & 0xFF) / 255.0,
+            blue:  Double( value        & 0xFF) / 255.0
+        )
+    }
+}
+
+private func coloredCircleImage(color: NSColor) -> NSImage {
+    let size = NSSize(width: 14, height: 14)
+    let image = NSImage(size: size, flipped: false) { rect in
+        color.setFill()
+        NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill()
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
 
 struct ShortcutHintPillBackground: View {
     var emphasis: Double = 1.0
@@ -158,7 +182,115 @@ final class SidebarState: ObservableObject {
     }
 }
 
+enum SidebarResizeInteraction {
+    static let handleWidth: CGFloat = 6
+    static let hitInset: CGFloat = 3
+
+    static var hitWidthPerSide: CGFloat {
+        hitInset + (handleWidth / 2)
+    }
+}
+
 // MARK: - File Drop Overlay
+
+enum DragOverlayRoutingPolicy {
+    static let bonsplitTabTransferType = NSPasteboard.PasteboardType("com.splittabbar.tabtransfer")
+    static let sidebarTabReorderType = NSPasteboard.PasteboardType(SidebarTabDragPayload.typeIdentifier)
+
+    static func hasBonsplitTabTransfer(_ pasteboardTypes: [NSPasteboard.PasteboardType]?) -> Bool {
+        guard let pasteboardTypes else { return false }
+        return pasteboardTypes.contains(bonsplitTabTransferType)
+    }
+
+    static func hasSidebarTabReorder(_ pasteboardTypes: [NSPasteboard.PasteboardType]?) -> Bool {
+        guard let pasteboardTypes else { return false }
+        return pasteboardTypes.contains(sidebarTabReorderType)
+    }
+
+    static func hasFileURL(_ pasteboardTypes: [NSPasteboard.PasteboardType]?) -> Bool {
+        guard let pasteboardTypes else { return false }
+        return pasteboardTypes.contains(.fileURL)
+    }
+
+    static func shouldCaptureFileDropDestination(
+        pasteboardTypes: [NSPasteboard.PasteboardType]?,
+        hasLocalDraggingSource: Bool
+    ) -> Bool {
+        // Local file drags (e.g. in-app draggable folder views) are valid drop
+        // inputs; rely on explicit non-file drag types below to avoid hijacking
+        // Bonsplit/sidebar drags.
+        _ = hasLocalDraggingSource
+        guard hasFileURL(pasteboardTypes) else { return false }
+
+        // Prefer explicit non-file drag types so stale fileURL entries cannot hijack
+        // Bonsplit tab drags or sidebar tab reorder drags.
+        if hasBonsplitTabTransfer(pasteboardTypes) { return false }
+        if hasSidebarTabReorder(pasteboardTypes) { return false }
+        return true
+    }
+
+    static func shouldCaptureFileDropDestination(
+        pasteboardTypes: [NSPasteboard.PasteboardType]?
+    ) -> Bool {
+        shouldCaptureFileDropDestination(
+            pasteboardTypes: pasteboardTypes,
+            hasLocalDraggingSource: false
+        )
+    }
+
+    static func shouldCaptureFileDropOverlay(
+        pasteboardTypes: [NSPasteboard.PasteboardType]?,
+        eventType: NSEvent.EventType?
+    ) -> Bool {
+        guard shouldCaptureFileDropDestination(pasteboardTypes: pasteboardTypes) else { return false }
+        guard isDragMouseEvent(eventType) else { return false }
+        return true
+    }
+
+    static func shouldCaptureSidebarExternalOverlay(
+        hasSidebarDragState: Bool,
+        pasteboardTypes: [NSPasteboard.PasteboardType]?
+    ) -> Bool {
+        guard hasSidebarDragState else { return false }
+        return hasSidebarTabReorder(pasteboardTypes)
+    }
+
+    static func shouldCaptureSidebarExternalOverlay(
+        draggedTabId: UUID?,
+        pasteboardTypes: [NSPasteboard.PasteboardType]?
+    ) -> Bool {
+        shouldCaptureSidebarExternalOverlay(
+            hasSidebarDragState: draggedTabId != nil,
+            pasteboardTypes: pasteboardTypes
+        )
+    }
+
+    static func shouldPassThroughPortalHitTesting(
+        pasteboardTypes: [NSPasteboard.PasteboardType]?,
+        eventType: NSEvent.EventType?
+    ) -> Bool {
+        guard isPortalDragEvent(eventType) else { return false }
+        return hasBonsplitTabTransfer(pasteboardTypes) || hasSidebarTabReorder(pasteboardTypes)
+    }
+
+    private static func isDragMouseEvent(_ eventType: NSEvent.EventType?) -> Bool {
+        eventType == .leftMouseDragged
+            || eventType == .rightMouseDragged
+            || eventType == .otherMouseDragged
+    }
+
+    private static func isPortalDragEvent(_ eventType: NSEvent.EventType?) -> Bool {
+        // Restrict portal pass-through to explicit drag-motion events so stale
+        // NSPasteboard(name: .drag) types cannot hijack normal pointer input.
+        guard let eventType else { return false }
+        switch eventType {
+        case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            return true
+        default:
+            return false
+        }
+    }
+}
 
 /// Transparent NSView installed on the window's theme frame (above the NSHostingView) to
 /// handle file/URL drags from Finder. Nested NSHostingController layers (created by bonsplit's
@@ -171,6 +303,14 @@ final class SidebarState: ObservableObject {
 final class FileDropOverlayView: NSView {
     /// Fallback handler when no terminal is found under the drop point.
     var onDrop: (([URL]) -> Bool)?
+    private var isForwardingMouseEvent = false
+    private weak var forwardedMouseDragTarget: NSView?
+    private var forwardedMouseDragButton: ForwardedMouseDragButton?
+    /// The WKWebView currently receiving forwarded drag events, so we can
+    /// synthesize draggingExited/draggingEntered as the cursor moves.
+    private weak var activeDragWebView: WKWebView?
+    private var lastHitTestLogSignature: String?
+    private var lastDragRouteLogSignatureByPhase: [String: String] = [:]
 
     override var acceptsFirstResponder: Bool { false }
 
@@ -181,22 +321,61 @@ final class FileDropOverlayView: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
 
-    // MARK: Hit-testing — only participate when the system drag pasteboard contains file
-    // URLs (i.e. a Finder file drag is in progress). For everything else — mouse events,
-    // sidebar tab reorder, bonsplit tab drags — return nil so events route to the content
-    // view below and SwiftUI / bonsplit drag-and-drop works normally.
+    private enum ForwardedMouseDragButton: Equatable {
+        case left
+        case right
+        case other(Int)
+    }
+
+    private func dragButton(for event: NSEvent) -> ForwardedMouseDragButton? {
+        switch event.type {
+        case .leftMouseDown, .leftMouseUp, .leftMouseDragged:
+            return .left
+        case .rightMouseDown, .rightMouseUp, .rightMouseDragged:
+            return .right
+        case .otherMouseDown, .otherMouseUp, .otherMouseDragged:
+            return .other(Int(event.buttonNumber))
+        default:
+            return nil
+        }
+    }
+
+    private func shouldTrackForwardedMouseDragStart(for eventType: NSEvent.EventType) -> Bool {
+        switch eventType {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func shouldTrackForwardedMouseDragEnd(for eventType: NSEvent.EventType) -> Bool {
+        switch eventType {
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            return true
+        default:
+            return false
+        }
+    }
+
+    // MARK: Hit-testing — participation is routed by DragOverlayRoutingPolicy so
+    // file-drop, bonsplit tab drags, and sidebar tab reorder drags cannot conflict.
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         let pb = NSPasteboard(name: .drag)
-        guard let types = pb.types, types.contains(.fileURL) else { return nil }
-
-        // The drag pasteboard can retain stale file types after a completed drag.
-        // Only participate during active drag-motion events.
         let eventType = NSApp.currentEvent?.type
-        let isDragMouseEvent = eventType == .leftMouseDragged
-            || eventType == .rightMouseDragged
-            || eventType == .otherMouseDragged
-        guard isDragMouseEvent else { return nil }
+        let shouldCapture = DragOverlayRoutingPolicy.shouldCaptureFileDropOverlay(
+            pasteboardTypes: pb.types,
+            eventType: eventType
+        )
+#if DEBUG
+        logHitTestDecision(
+            pasteboardTypes: pb.types,
+            eventType: eventType,
+            shouldCapture: shouldCapture
+        )
+#endif
+        guard shouldCapture else { return nil }
 
         return super.hitTest(point)
     }
@@ -207,12 +386,44 @@ final class FileDropOverlayView: NSView {
     // window.sendEvent(), which caches the mouse target and causes infinite recursion.
 
     private func forwardEvent(_ event: NSEvent) {
+        guard !isForwardingMouseEvent else { return }
         guard let window, let contentView = window.contentView else { return }
+        let eventButton = dragButton(for: event)
+
+        isForwardingMouseEvent = true
         isHidden = true
-        let point = contentView.convert(event.locationInWindow, from: nil)
-        let target = contentView.hitTest(point)
-        isHidden = false
-        guard let target else { return }
+        defer {
+            isHidden = false
+            isForwardingMouseEvent = false
+        }
+
+        let target: NSView?
+        if let eventButton,
+           forwardedMouseDragButton == eventButton,
+           let activeTarget = forwardedMouseDragTarget,
+           activeTarget.window != nil {
+            // Preserve normal AppKit mouse-delivery semantics: once a drag starts,
+            // keep routing dragged/up events to the original mouseDown target.
+            target = activeTarget
+        } else {
+            let point = contentView.convert(event.locationInWindow, from: nil)
+            target = contentView.hitTest(point)
+        }
+
+        guard let target, target !== self else {
+            if shouldTrackForwardedMouseDragEnd(for: event.type),
+               let eventButton,
+               forwardedMouseDragButton == eventButton {
+                forwardedMouseDragTarget = nil
+                forwardedMouseDragButton = nil
+            }
+            return
+        }
+
+        if shouldTrackForwardedMouseDragStart(for: event.type), let eventButton {
+            forwardedMouseDragTarget = target
+            forwardedMouseDragButton = eventButton
+        }
 
         switch event.type {
         case .leftMouseDown: target.mouseDown(with: event)
@@ -227,6 +438,13 @@ final class FileDropOverlayView: NSView {
         case .scrollWheel: target.scrollWheel(with: event)
         default: break
         }
+
+        if shouldTrackForwardedMouseDragEnd(for: event.type),
+           let eventButton,
+           forwardedMouseDragButton == eventButton {
+            forwardedMouseDragTarget = nil
+            forwardedMouseDragButton = nil
+        }
     }
 
     override func mouseDown(with event: NSEvent) { forwardEvent(event) }
@@ -240,30 +458,243 @@ final class FileDropOverlayView: NSView {
     override func otherMouseDragged(with event: NSEvent) { forwardEvent(event) }
     override func scrollWheel(with event: NSEvent) { forwardEvent(event) }
 
-    // MARK: NSDraggingDestination – only accept file drops over terminal views.
+    // MARK: NSDraggingDestination – accept file drops over terminal and browser views.
+    //
+    // AppKit sends draggingEntered once when the drag enters this overlay, then
+    // draggingUpdated as the cursor moves within it. We track which WKWebView (if
+    // any) is under the cursor and synthesize enter/exit calls so the browser's
+    // HTML5 drag events (dragenter, dragleave, drop) fire correctly.
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        return dragOperationForSender(sender)
+        return updateDragTarget(sender, phase: "entered")
     }
 
     override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        return dragOperationForSender(sender)
+        return updateDragTarget(sender, phase: "updated")
+    }
+
+    override func draggingExited(_ sender: (any NSDraggingInfo)?) {
+        if let prev = activeDragWebView {
+            prev.draggingExited(sender)
+            activeDragWebView = nil
+        }
     }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
-        guard let terminal = terminalUnderPoint(sender.draggingLocation) else { return false }
+        let hasLocalDraggingSource = sender.draggingSource != nil
+        let types = sender.draggingPasteboard.types
+        let shouldCapture = DragOverlayRoutingPolicy.shouldCaptureFileDropDestination(
+            pasteboardTypes: types,
+            hasLocalDraggingSource: hasLocalDraggingSource
+        )
+        let webView = activeDragWebView
+        activeDragWebView = nil
+        let terminal = terminalUnderPoint(sender.draggingLocation)
+        let hasTerminalTarget = terminal != nil
+#if DEBUG
+        logDragRouteDecision(
+            phase: "perform",
+            pasteboardTypes: types,
+            shouldCapture: shouldCapture,
+            hasLocalDraggingSource: hasLocalDraggingSource,
+            hasTerminalTarget: hasTerminalTarget
+        )
+#endif
+        guard shouldCapture else { return false }
+        if let webView {
+            return webView.performDragOperation(sender)
+        }
+        guard let terminal else { return false }
         return terminal.performDragOperation(sender)
     }
 
-    private func dragOperationForSender(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        guard let types = sender.draggingPasteboard.types,
-              types.contains(.fileURL),
-              terminalUnderPoint(sender.draggingLocation) != nil else {
-            return []
+    private func updateDragTarget(_ sender: any NSDraggingInfo, phase: String) -> NSDragOperation {
+        let loc = sender.draggingLocation
+        let hasLocalDraggingSource = sender.draggingSource != nil
+        let types = sender.draggingPasteboard.types
+        let shouldCapture = DragOverlayRoutingPolicy.shouldCaptureFileDropDestination(
+            pasteboardTypes: types,
+            hasLocalDraggingSource: hasLocalDraggingSource
+        )
+        let webView = shouldCapture ? webViewUnderPoint(loc) : nil
+
+        if let prev = activeDragWebView, prev !== webView {
+            prev.draggingExited(sender)
+            activeDragWebView = nil
         }
+
+        if let webView {
+            if activeDragWebView !== webView {
+                activeDragWebView = webView
+                return webView.draggingEntered(sender)
+            }
+            return webView.draggingUpdated(sender)
+        }
+
+        let hasTerminalTarget = terminalUnderPoint(loc) != nil
+#if DEBUG
+        logDragRouteDecision(
+            phase: phase,
+            pasteboardTypes: types,
+            shouldCapture: shouldCapture,
+            hasLocalDraggingSource: hasLocalDraggingSource,
+            hasTerminalTarget: hasTerminalTarget
+        )
+#endif
+        guard shouldCapture, hasTerminalTarget else { return [] }
         return .copy
     }
 
+    private func debugPasteboardTypes(_ types: [NSPasteboard.PasteboardType]?) -> String {
+        guard let types, !types.isEmpty else { return "-" }
+        return types.map(\.rawValue).joined(separator: ",")
+    }
+
+    /// Hit-tests the window to find a WKWebView (browser panel) under the cursor.
+    private func webViewUnderPoint(_ windowPoint: NSPoint) -> WKWebView? {
+        guard let window, let contentView = window.contentView else { return nil }
+        isHidden = true
+        defer { isHidden = false }
+        let point = contentView.convert(windowPoint, from: nil)
+        let hitView = contentView.hitTest(point)
+
+        var current: NSView? = hitView
+        while let view = current {
+            if let webView = view as? WKWebView { return webView }
+            current = view.superview
+        }
+        return nil
+    }
+
+    private func debugTopHitViewForCurrentEvent() -> String {
+        guard let window,
+              let currentEvent = NSApp.currentEvent,
+              let contentView = window.contentView,
+              let themeFrame = contentView.superview else { return "-" }
+
+        let pointInTheme = themeFrame.convert(currentEvent.locationInWindow, from: nil)
+        isHidden = true
+        defer { isHidden = false }
+
+        guard let hit = themeFrame.hitTest(pointInTheme) else { return "nil" }
+        var chain: [String] = []
+        var current: NSView? = hit
+        var depth = 0
+        while let view = current, depth < 6 {
+            chain.append(debugHitViewDescriptor(view))
+            current = view.superview
+            depth += 1
+        }
+        return chain.joined(separator: "->")
+    }
+
+    private func debugHitViewDescriptor(_ view: NSView) -> String {
+        let className = String(describing: type(of: view))
+        let ptr = String(describing: Unmanaged.passUnretained(view).toOpaque())
+        let dragTypes = debugRegisteredDragTypes(view)
+        return "\(className)@\(ptr){dragTypes=\(dragTypes)}"
+    }
+
+    private func debugRegisteredDragTypes(_ view: NSView) -> String {
+        let types = view.registeredDraggedTypes
+        guard !types.isEmpty else { return "-" }
+
+        let interestingTypes = types.filter { type in
+            let raw = type.rawValue
+            return raw == NSPasteboard.PasteboardType.fileURL.rawValue
+                || raw == DragOverlayRoutingPolicy.bonsplitTabTransferType.rawValue
+                || raw == DragOverlayRoutingPolicy.sidebarTabReorderType.rawValue
+                || raw.contains("public.text")
+                || raw.contains("public.url")
+                || raw.contains("public.data")
+        }
+        let selected = interestingTypes.isEmpty ? Array(types.prefix(3)) : interestingTypes
+        let rendered = selected.map(\.rawValue).joined(separator: ",")
+        if selected.count < types.count {
+            return "\(rendered),+\(types.count - selected.count)"
+        }
+        return rendered
+    }
+
+    private func hasRelevantDragTypes(_ types: [NSPasteboard.PasteboardType]?) -> Bool {
+        guard let types else { return false }
+        return types.contains(.fileURL)
+            || types.contains(DragOverlayRoutingPolicy.bonsplitTabTransferType)
+            || types.contains(DragOverlayRoutingPolicy.sidebarTabReorderType)
+    }
+
+    private func debugEventName(_ eventType: NSEvent.EventType?) -> String {
+        guard let eventType else { return "none" }
+        switch eventType {
+        case .cursorUpdate: return "cursorUpdate"
+        case .appKitDefined: return "appKitDefined"
+        case .systemDefined: return "systemDefined"
+        case .applicationDefined: return "applicationDefined"
+        case .periodic: return "periodic"
+        case .mouseMoved: return "mouseMoved"
+        case .mouseEntered: return "mouseEntered"
+        case .mouseExited: return "mouseExited"
+        case .flagsChanged: return "flagsChanged"
+        case .leftMouseDown: return "leftMouseDown"
+        case .leftMouseUp: return "leftMouseUp"
+        case .leftMouseDragged: return "leftMouseDragged"
+        case .rightMouseDown: return "rightMouseDown"
+        case .rightMouseUp: return "rightMouseUp"
+        case .rightMouseDragged: return "rightMouseDragged"
+        case .otherMouseDown: return "otherMouseDown"
+        case .otherMouseUp: return "otherMouseUp"
+        case .otherMouseDragged: return "otherMouseDragged"
+        case .scrollWheel: return "scrollWheel"
+        default: return "other(\(eventType.rawValue))"
+        }
+    }
+
+#if DEBUG
+    private func logHitTestDecision(
+        pasteboardTypes: [NSPasteboard.PasteboardType]?,
+        eventType: NSEvent.EventType?,
+        shouldCapture: Bool
+    ) {
+        let isDragEvent = eventType == .leftMouseDragged
+            || eventType == .rightMouseDragged
+            || eventType == .otherMouseDragged
+        guard shouldCapture || isDragEvent || hasRelevantDragTypes(pasteboardTypes) else { return }
+
+        let signature = "\(shouldCapture ? 1 : 0)|\(debugEventName(eventType))|\(debugPasteboardTypes(pasteboardTypes))"
+        guard lastHitTestLogSignature != signature else { return }
+        lastHitTestLogSignature = signature
+        dlog(
+            "overlay.fileDrop.hitTest capture=\(shouldCapture ? 1 : 0) " +
+            "event=\(debugEventName(eventType)) " +
+            "topHit=\(debugTopHitViewForCurrentEvent()) " +
+            "types=\(debugPasteboardTypes(pasteboardTypes))"
+        )
+    }
+
+    private func logDragRouteDecision(
+        phase: String,
+        pasteboardTypes: [NSPasteboard.PasteboardType]?,
+        shouldCapture: Bool,
+        hasLocalDraggingSource: Bool,
+        hasTerminalTarget: Bool
+    ) {
+        guard shouldCapture || hasRelevantDragTypes(pasteboardTypes) else { return }
+        let signature = [
+            shouldCapture ? "1" : "0",
+            hasLocalDraggingSource ? "1" : "0",
+            hasTerminalTarget ? "1" : "0",
+            debugPasteboardTypes(pasteboardTypes)
+        ].joined(separator: "|")
+        guard lastDragRouteLogSignatureByPhase[phase] != signature else { return }
+        lastDragRouteLogSignatureByPhase[phase] = signature
+        dlog(
+            "overlay.fileDrop.\(phase) capture=\(shouldCapture ? 1 : 0) " +
+            "localSource=\(hasLocalDraggingSource ? 1 : 0) " +
+            "hasTerminal=\(hasTerminalTarget ? 1 : 0) " +
+            "types=\(debugPasteboardTypes(pasteboardTypes))"
+        )
+    }
+#endif
     /// Hit-tests the window to find the GhosttyNSView under the cursor.
     func terminalUnderPoint(_ windowPoint: NSPoint) -> GhosttyNSView? {
         if let window,
@@ -273,9 +704,9 @@ final class FileDropOverlayView: NSView {
 
         guard let window, let contentView = window.contentView else { return nil }
         isHidden = true
+        defer { isHidden = false }
         let point = contentView.convert(windowPoint, from: nil)
         let hitView = contentView.hitTest(point)
-        isHidden = false
 
         var current: NSView? = hitView
         while let view = current {
@@ -287,6 +718,272 @@ final class FileDropOverlayView: NSView {
 }
 
 var fileDropOverlayKey: UInt8 = 0
+private var commandPaletteWindowOverlayKey: UInt8 = 0
+let commandPaletteOverlayContainerIdentifier = NSUserInterfaceItemIdentifier("cmux.commandPalette.overlay.container")
+
+@MainActor
+private final class CommandPaletteOverlayContainerView: NSView {
+    var capturesMouseEvents = false
+
+    override var isOpaque: Bool { false }
+    override var acceptsFirstResponder: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard capturesMouseEvents else { return nil }
+        return super.hitTest(point)
+    }
+}
+
+@MainActor
+private final class WindowCommandPaletteOverlayController: NSObject {
+    private weak var window: NSWindow?
+    private let containerView = CommandPaletteOverlayContainerView(frame: .zero)
+    private let hostingView = NSHostingView(rootView: AnyView(EmptyView()))
+    private var installConstraints: [NSLayoutConstraint] = []
+    private weak var installedThemeFrame: NSView?
+    private var focusLockTimer: DispatchSourceTimer?
+    private var scheduledFocusWorkItem: DispatchWorkItem?
+
+    init(window: NSWindow) {
+        self.window = window
+        super.init()
+        containerView.translatesAutoresizingMaskIntoConstraints = false
+        containerView.wantsLayer = true
+        containerView.layer?.backgroundColor = NSColor.clear.cgColor
+        containerView.isHidden = true
+        containerView.alphaValue = 0
+        containerView.capturesMouseEvents = false
+        containerView.identifier = commandPaletteOverlayContainerIdentifier
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        hostingView.wantsLayer = true
+        hostingView.layer?.backgroundColor = NSColor.clear.cgColor
+        containerView.addSubview(hostingView)
+        NSLayoutConstraint.activate([
+            hostingView.topAnchor.constraint(equalTo: containerView.topAnchor),
+            hostingView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
+            hostingView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+            hostingView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
+        ])
+        _ = ensureInstalled()
+    }
+
+    @discardableResult
+    private func ensureInstalled() -> Bool {
+        guard let window,
+              let contentView = window.contentView,
+              let themeFrame = contentView.superview else { return false }
+
+        if containerView.superview !== themeFrame {
+            NSLayoutConstraint.deactivate(installConstraints)
+            installConstraints.removeAll()
+            containerView.removeFromSuperview()
+            themeFrame.addSubview(containerView, positioned: .above, relativeTo: nil)
+            installConstraints = [
+                containerView.topAnchor.constraint(equalTo: contentView.topAnchor),
+                containerView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+                containerView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+                containerView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            ]
+            NSLayoutConstraint.activate(installConstraints)
+            installedThemeFrame = themeFrame
+        } else if themeFrame.subviews.last !== containerView {
+            themeFrame.addSubview(containerView, positioned: .above, relativeTo: nil)
+        }
+
+        return true
+    }
+
+    private func isPaletteResponder(_ responder: NSResponder?) -> Bool {
+        guard let responder else { return false }
+
+        if let view = responder as? NSView, view.isDescendant(of: containerView) {
+            return true
+        }
+
+        if let textView = responder as? NSTextView {
+            if let delegateView = textView.delegate as? NSView,
+               delegateView.isDescendant(of: containerView) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func isPaletteFieldEditor(_ textView: NSTextView) -> Bool {
+        guard textView.isFieldEditor else { return false }
+
+        if let delegateView = textView.delegate as? NSView,
+           delegateView.isDescendant(of: containerView) {
+            return true
+        }
+
+        // SwiftUI text fields can keep a field editor delegate that isn't an NSView.
+        // Fall back to validating editor ownership from the mounted palette text field.
+        if let textField = firstEditableTextField(in: hostingView),
+           textField.currentEditor() === textView {
+            return true
+        }
+
+        return false
+    }
+
+    private func isPaletteTextInputFirstResponder(_ responder: NSResponder?) -> Bool {
+        guard let responder else { return false }
+
+        if let textView = responder as? NSTextView {
+            return isPaletteFieldEditor(textView)
+        }
+
+        if let textField = responder as? NSTextField {
+            return textField.isDescendant(of: containerView)
+        }
+
+        return false
+    }
+
+    private func firstEditableTextField(in view: NSView) -> NSTextField? {
+        if let textField = view as? NSTextField,
+           textField.isEditable,
+           textField.isEnabled,
+           !textField.isHiddenOrHasHiddenAncestor {
+            return textField
+        }
+
+        for subview in view.subviews {
+            if let match = firstEditableTextField(in: subview) {
+                return match
+            }
+        }
+        return nil
+    }
+
+    private func scheduleFocusIntoPalette(retries: Int = 4) {
+        scheduledFocusWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.scheduledFocusWorkItem = nil
+            self?.focusIntoPalette(retries: retries)
+        }
+        scheduledFocusWorkItem = workItem
+        DispatchQueue.main.async(execute: workItem)
+    }
+
+    private func focusIntoPalette(retries: Int) {
+        guard let window else { return }
+        if isPaletteTextInputFirstResponder(window.firstResponder) {
+            return
+        }
+
+        if let textField = firstEditableTextField(in: hostingView),
+           window.makeFirstResponder(textField),
+           isPaletteTextInputFirstResponder(window.firstResponder) {
+            normalizeSelectionAfterProgrammaticFocus()
+            return
+        }
+
+        if window.makeFirstResponder(containerView) {
+            if let textField = firstEditableTextField(in: hostingView),
+               window.makeFirstResponder(textField),
+               isPaletteTextInputFirstResponder(window.firstResponder) {
+                normalizeSelectionAfterProgrammaticFocus()
+                return
+            }
+        }
+
+        guard retries > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+            self?.focusIntoPalette(retries: retries - 1)
+        }
+    }
+
+    private func startFocusLockTimer() {
+        guard focusLockTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(80), leeway: .milliseconds(12))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard let window = self.window else {
+                self.stopFocusLockTimer()
+                return
+            }
+            if self.isPaletteTextInputFirstResponder(window.firstResponder) {
+                return
+            }
+            self.focusIntoPalette(retries: 1)
+        }
+        focusLockTimer = timer
+        timer.resume()
+    }
+
+    private func stopFocusLockTimer() {
+        focusLockTimer?.cancel()
+        focusLockTimer = nil
+        scheduledFocusWorkItem?.cancel()
+        scheduledFocusWorkItem = nil
+    }
+
+    private func normalizeSelectionAfterProgrammaticFocus() {
+        guard let window,
+              let editor = window.firstResponder as? NSTextView,
+              editor.isFieldEditor else { return }
+
+        let text = editor.string
+        let length = (text as NSString).length
+        let selection = editor.selectedRange()
+        guard length > 0 else { return }
+        guard selection.location == 0, selection.length == length else { return }
+
+        // Keep commands-mode prefix semantics stable after focus re-assertions:
+        // if AppKit selected the entire query (e.g. ">foo"), restore caret-at-end
+        // so the next keystroke appends instead of replacing and switching modes.
+        guard text.hasPrefix(">") else { return }
+        editor.setSelectedRange(NSRange(location: length, length: 0))
+    }
+
+    func update(rootView: AnyView, isVisible: Bool) {
+        guard ensureInstalled() else { return }
+        if isVisible {
+            hostingView.rootView = rootView
+            containerView.capturesMouseEvents = true
+            containerView.isHidden = false
+            containerView.alphaValue = 1
+            if let themeFrame = installedThemeFrame, themeFrame.subviews.last !== containerView {
+                themeFrame.addSubview(containerView, positioned: .above, relativeTo: nil)
+            }
+            startFocusLockTimer()
+            if let window, !isPaletteTextInputFirstResponder(window.firstResponder) {
+                scheduleFocusIntoPalette(retries: 8)
+            }
+        } else {
+            stopFocusLockTimer()
+            if let window, isPaletteResponder(window.firstResponder) {
+                _ = window.makeFirstResponder(nil)
+            }
+            hostingView.rootView = AnyView(EmptyView())
+            containerView.capturesMouseEvents = false
+            containerView.alphaValue = 0
+            containerView.isHidden = true
+        }
+    }
+}
+
+@MainActor
+private func commandPaletteWindowOverlayController(for window: NSWindow) -> WindowCommandPaletteOverlayController {
+    if let existing = objc_getAssociatedObject(window, &commandPaletteWindowOverlayKey) as? WindowCommandPaletteOverlayController {
+        return existing
+    }
+    let controller = WindowCommandPaletteOverlayController(window: window)
+    objc_setAssociatedObject(window, &commandPaletteWindowOverlayKey, controller, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    return controller
+}
+
+private struct CommandPaletteRowFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [Int: CGRect] = [:]
+
+    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, rhs in rhs })
+    }
+}
 
 enum WorkspaceMountPolicy {
     // Keep only the selected workspace mounted to minimize layer-tree traversal.
@@ -395,10 +1092,9 @@ struct ContentView: View {
     @EnvironmentObject var sidebarState: SidebarState
     @EnvironmentObject var sidebarSelectionState: SidebarSelectionState
     @State private var sidebarWidth: CGFloat = 200
-    @State private var sidebarMinX: CGFloat = 0
-    @State private var isResizerHovering = false
+    @State private var hoveredResizerHandles: Set<SidebarResizerHandle> = []
     @State private var isResizerDragging = false
-    private let sidebarHandleWidth: CGFloat = 6
+    @State private var sidebarDragStartWidth: CGFloat?
     @State private var selectedTabIds: Set<UUID> = []
     @State private var mountedWorkspaceIds: [UUID] = []
     @State private var lastSidebarSelectionIndex: Int? = nil
@@ -411,6 +1107,483 @@ struct ContentView: View {
     @State private var workspaceHandoffGeneration: UInt64 = 0
     @State private var workspaceHandoffFallbackTask: Task<Void, Never>?
     @State private var titlebarThemeGeneration: UInt64 = 0
+    @State private var sidebarDraggedTabId: UUID?
+    @State private var titlebarTextUpdateCoalescer = NotificationBurstCoalescer(delay: 1.0 / 30.0)
+    @State private var sidebarResizerCursorReleaseWorkItem: DispatchWorkItem?
+    @State private var sidebarResizerPointerMonitor: Any?
+    @State private var isResizerBandActive = false
+    @State private var isSidebarResizerCursorActive = false
+    @State private var sidebarResizerCursorStabilizer: DispatchSourceTimer?
+    @State private var isCommandPalettePresented = false
+    @State private var commandPaletteQuery: String = ""
+    @State private var commandPaletteMode: CommandPaletteMode = .commands
+    @State private var commandPaletteRenameDraft: String = ""
+    @State private var commandPaletteSelectedResultIndex: Int = 0
+    @State private var commandPaletteHoveredResultIndex: Int?
+    @State private var commandPaletteLastSelectionIndex: Int = 0
+    @State private var commandPaletteRowFrames: [Int: CGRect] = [:]
+    @State private var commandPaletteRestoreFocusTarget: CommandPaletteRestoreFocusTarget?
+    @State private var commandPaletteUsageHistoryByCommandId: [String: CommandPaletteUsageEntry] = [:]
+    @AppStorage(CommandPaletteRenameSelectionSettings.selectAllOnFocusKey)
+    private var commandPaletteRenameSelectAllOnFocus = CommandPaletteRenameSelectionSettings.defaultSelectAllOnFocus
+    @FocusState private var isCommandPaletteSearchFocused: Bool
+    @FocusState private var isCommandPaletteRenameFocused: Bool
+
+    private enum CommandPaletteMode {
+        case commands
+        case renameInput(CommandPaletteRenameTarget)
+        case renameConfirm(CommandPaletteRenameTarget, proposedName: String)
+    }
+
+    private enum CommandPaletteListScope: String {
+        case commands
+        case switcher
+    }
+
+    private struct CommandPaletteRenameTarget: Equatable {
+        enum Kind: Equatable {
+            case workspace(workspaceId: UUID)
+            case tab(workspaceId: UUID, panelId: UUID)
+        }
+
+        let kind: Kind
+        let currentName: String
+
+        var title: String {
+            switch kind {
+            case .workspace:
+                return "Rename Workspace"
+            case .tab:
+                return "Rename Tab"
+            }
+        }
+
+        var description: String {
+            switch kind {
+            case .workspace:
+                return "Choose a custom workspace name."
+            case .tab:
+                return "Choose a custom tab name."
+            }
+        }
+
+        var placeholder: String {
+            switch kind {
+            case .workspace:
+                return "Workspace name"
+            case .tab:
+                return "Tab name"
+            }
+        }
+    }
+
+    private struct CommandPaletteRestoreFocusTarget {
+        let workspaceId: UUID
+        let panelId: UUID
+    }
+
+    private enum CommandPaletteInputFocusTarget {
+        case search
+        case rename
+    }
+
+    private enum CommandPaletteTextSelectionBehavior {
+        case caretAtEnd
+        case selectAll
+    }
+
+    private enum CommandPaletteTrailingLabelStyle {
+        case shortcut
+        case kind
+    }
+
+    enum CommandPaletteScrollAnchor: Equatable {
+        case top
+        case bottom
+    }
+
+    private struct CommandPaletteTrailingLabel {
+        let text: String
+        let style: CommandPaletteTrailingLabelStyle
+    }
+
+    private struct CommandPaletteInputFocusPolicy {
+        let focusTarget: CommandPaletteInputFocusTarget
+        let selectionBehavior: CommandPaletteTextSelectionBehavior
+
+        static let search = CommandPaletteInputFocusPolicy(
+            focusTarget: .search,
+            selectionBehavior: .caretAtEnd
+        )
+    }
+
+    private struct CommandPaletteCommand: Identifiable {
+        let id: String
+        let rank: Int
+        let title: String
+        let subtitle: String
+        let shortcutHint: String?
+        let keywords: [String]
+        let dismissOnRun: Bool
+        let action: () -> Void
+
+        var searchableTexts: [String] {
+            [title, subtitle] + keywords
+        }
+    }
+
+    private struct CommandPaletteUsageEntry: Codable {
+        var useCount: Int
+        var lastUsedAt: TimeInterval
+    }
+
+    private struct CommandPaletteContextSnapshot {
+        private var boolValues: [String: Bool] = [:]
+        private var stringValues: [String: String] = [:]
+
+        mutating func setBool(_ key: String, _ value: Bool) {
+            boolValues[key] = value
+        }
+
+        mutating func setString(_ key: String, _ value: String?) {
+            guard let value, !value.isEmpty else {
+                stringValues.removeValue(forKey: key)
+                return
+            }
+            stringValues[key] = value
+        }
+
+        func bool(_ key: String) -> Bool {
+            boolValues[key] ?? false
+        }
+
+        func string(_ key: String) -> String? {
+            stringValues[key]
+        }
+    }
+
+    private enum CommandPaletteContextKeys {
+        static let hasWorkspace = "workspace.hasSelection"
+        static let workspaceName = "workspace.name"
+        static let workspaceHasCustomName = "workspace.hasCustomName"
+        static let workspaceShouldPin = "workspace.shouldPin"
+
+        static let hasFocusedPanel = "panel.hasFocus"
+        static let panelName = "panel.name"
+        static let panelIsBrowser = "panel.isBrowser"
+        static let panelIsTerminal = "panel.isTerminal"
+        static let panelHasCustomName = "panel.hasCustomName"
+        static let panelShouldPin = "panel.shouldPin"
+        static let panelHasUnread = "panel.hasUnread"
+
+        static let updateHasAvailable = "update.hasAvailable"
+    }
+
+    private struct CommandPaletteCommandContribution {
+        let commandId: String
+        let title: (CommandPaletteContextSnapshot) -> String
+        let subtitle: (CommandPaletteContextSnapshot) -> String
+        let shortcutHint: String?
+        let keywords: [String]
+        let dismissOnRun: Bool
+        let when: (CommandPaletteContextSnapshot) -> Bool
+        let enablement: (CommandPaletteContextSnapshot) -> Bool
+
+        init(
+            commandId: String,
+            title: @escaping (CommandPaletteContextSnapshot) -> String,
+            subtitle: @escaping (CommandPaletteContextSnapshot) -> String,
+            shortcutHint: String? = nil,
+            keywords: [String] = [],
+            dismissOnRun: Bool = true,
+            when: @escaping (CommandPaletteContextSnapshot) -> Bool = { _ in true },
+            enablement: @escaping (CommandPaletteContextSnapshot) -> Bool = { _ in true }
+        ) {
+            self.commandId = commandId
+            self.title = title
+            self.subtitle = subtitle
+            self.shortcutHint = shortcutHint
+            self.keywords = keywords
+            self.dismissOnRun = dismissOnRun
+            self.when = when
+            self.enablement = enablement
+        }
+    }
+
+    private struct CommandPaletteHandlerRegistry {
+        private var handlers: [String: () -> Void] = [:]
+
+        mutating func register(commandId: String, handler: @escaping () -> Void) {
+            handlers[commandId] = handler
+        }
+
+        func handler(for commandId: String) -> (() -> Void)? {
+            handlers[commandId]
+        }
+    }
+
+    private struct CommandPaletteSearchResult: Identifiable {
+        let command: CommandPaletteCommand
+        let score: Int
+        let titleMatchIndices: Set<Int>
+
+        var id: String { command.id }
+    }
+
+    private struct CommandPaletteSwitcherWindowContext {
+        let windowId: UUID
+        let tabManager: TabManager
+        let selectedWorkspaceId: UUID?
+        let windowLabel: String?
+    }
+
+    private static let fixedSidebarResizeCursor = NSCursor(
+        image: NSCursor.resizeLeftRight.image,
+        hotSpot: NSCursor.resizeLeftRight.hotSpot
+    )
+    private static let commandPaletteUsageDefaultsKey = "commandPalette.commandUsage.v1"
+    private static let commandPaletteCommandsPrefix = ">"
+
+    private enum SidebarResizerHandle: Hashable {
+        case divider
+    }
+
+    private var sidebarResizerHitWidthPerSide: CGFloat {
+        SidebarResizeInteraction.hitWidthPerSide
+    }
+
+    private var maxSidebarWidth: CGFloat {
+        (NSApp.keyWindow?.screen?.frame.width ?? NSScreen.main?.frame.width ?? 1920) * 2 / 3
+    }
+
+    private func activateSidebarResizerCursor() {
+        sidebarResizerCursorReleaseWorkItem?.cancel()
+        sidebarResizerCursorReleaseWorkItem = nil
+        isSidebarResizerCursorActive = true
+        Self.fixedSidebarResizeCursor.set()
+    }
+
+    private func releaseSidebarResizerCursorIfNeeded(force: Bool = false) {
+        let isLeftMouseButtonDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
+        let shouldKeepCursor = !force
+            && (isResizerDragging || isResizerBandActive || !hoveredResizerHandles.isEmpty || isLeftMouseButtonDown)
+        guard !shouldKeepCursor else { return }
+        guard isSidebarResizerCursorActive else { return }
+        isSidebarResizerCursorActive = false
+        NSCursor.arrow.set()
+    }
+
+    private func scheduleSidebarResizerCursorRelease(force: Bool = false, delay: TimeInterval = 0) {
+        sidebarResizerCursorReleaseWorkItem?.cancel()
+        let workItem = DispatchWorkItem {
+            sidebarResizerCursorReleaseWorkItem = nil
+            releaseSidebarResizerCursorIfNeeded(force: force)
+        }
+        sidebarResizerCursorReleaseWorkItem = workItem
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        } else {
+            DispatchQueue.main.async(execute: workItem)
+        }
+    }
+
+    private func dividerBandContains(pointInContent point: NSPoint, contentBounds: NSRect) -> Bool {
+        guard point.y >= contentBounds.minY, point.y <= contentBounds.maxY else { return false }
+        let minX = sidebarWidth - sidebarResizerHitWidthPerSide
+        let maxX = sidebarWidth + sidebarResizerHitWidthPerSide
+        return point.x >= minX && point.x <= maxX
+    }
+
+    private func updateSidebarResizerBandState(using event: NSEvent? = nil) {
+        guard sidebarState.isVisible,
+              let window = observedWindow,
+              let contentView = window.contentView else {
+            isResizerBandActive = false
+            scheduleSidebarResizerCursorRelease(force: true)
+            return
+        }
+
+        // Use live global pointer location instead of per-event coordinates.
+        // Overlapping tracking areas (notably WKWebView) can deliver stale/jittery
+        // event locations during cursor updates, which causes visible cursor flicker.
+        let pointInWindow = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let pointInContent = contentView.convert(pointInWindow, from: nil)
+        let isInDividerBand = dividerBandContains(pointInContent: pointInContent, contentBounds: contentView.bounds)
+        isResizerBandActive = isInDividerBand
+
+        if isInDividerBand || isResizerDragging {
+            activateSidebarResizerCursor()
+            startSidebarResizerCursorStabilizer()
+            // AppKit cursorUpdate handlers from overlapped portal/web views can run
+            // after our local monitor callback and temporarily reset the cursor.
+            // Re-assert on the next runloop turn to keep the resize cursor stable.
+            DispatchQueue.main.async {
+                Self.fixedSidebarResizeCursor.set()
+            }
+        } else {
+            stopSidebarResizerCursorStabilizer()
+            scheduleSidebarResizerCursorRelease()
+        }
+    }
+
+    private func startSidebarResizerCursorStabilizer() {
+        guard sidebarResizerCursorStabilizer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(16), leeway: .milliseconds(2))
+        timer.setEventHandler {
+            updateSidebarResizerBandState()
+            if isResizerBandActive || isResizerDragging {
+                Self.fixedSidebarResizeCursor.set()
+            } else {
+                stopSidebarResizerCursorStabilizer()
+            }
+        }
+        sidebarResizerCursorStabilizer = timer
+        timer.resume()
+    }
+
+    private func stopSidebarResizerCursorStabilizer() {
+        sidebarResizerCursorStabilizer?.cancel()
+        sidebarResizerCursorStabilizer = nil
+    }
+
+    private func installSidebarResizerPointerMonitorIfNeeded() {
+        guard sidebarResizerPointerMonitor == nil else { return }
+        observedWindow?.acceptsMouseMovedEvents = true
+        sidebarResizerPointerMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [
+                .mouseMoved,
+                .mouseEntered,
+                .mouseExited,
+                .cursorUpdate,
+                .appKitDefined,
+                .systemDefined,
+                .leftMouseDown,
+                .leftMouseUp,
+                .leftMouseDragged,
+            ]
+        ) { event in
+            updateSidebarResizerBandState(using: event)
+            let shouldOverrideCursorEvent: Bool = {
+                switch event.type {
+                case .cursorUpdate, .mouseMoved, .mouseEntered, .mouseExited, .appKitDefined, .systemDefined:
+                    return true
+                default:
+                    return false
+                }
+            }()
+            if shouldOverrideCursorEvent, (isResizerBandActive || isResizerDragging) {
+                // Consume hover motion in divider band so overlapped views cannot
+                // continuously reassert their own cursor while we are resizing.
+                activateSidebarResizerCursor()
+                Self.fixedSidebarResizeCursor.set()
+                return nil
+            }
+            return event
+        }
+        updateSidebarResizerBandState()
+    }
+
+    private func removeSidebarResizerPointerMonitor() {
+        if let monitor = sidebarResizerPointerMonitor {
+            NSEvent.removeMonitor(monitor)
+            sidebarResizerPointerMonitor = nil
+        }
+        isResizerBandActive = false
+        isSidebarResizerCursorActive = false
+        stopSidebarResizerCursorStabilizer()
+        scheduleSidebarResizerCursorRelease(force: true)
+    }
+
+    private func sidebarResizerHandleOverlay(
+        _ handle: SidebarResizerHandle,
+        width: CGFloat,
+        accessibilityIdentifier: String? = nil
+    ) -> some View {
+        Color.clear
+            .frame(width: width)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering {
+                    hoveredResizerHandles.insert(handle)
+                    activateSidebarResizerCursor()
+                } else {
+                    hoveredResizerHandles.remove(handle)
+                    let isLeftMouseButtonDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
+                    if isLeftMouseButtonDown {
+                        // Keep resize cursor pinned through mouse-down so AppKit
+                        // cursorUpdate events from overlapping views do not flash arrow.
+                        activateSidebarResizerCursor()
+                    } else {
+                        // Give mouse-down + drag-start callbacks time to establish state
+                        // before any cursor pop is attempted.
+                        scheduleSidebarResizerCursorRelease(delay: 0.05)
+                    }
+                }
+                updateSidebarResizerBandState()
+            }
+            .onDisappear {
+                hoveredResizerHandles.remove(handle)
+                isResizerDragging = false
+                sidebarDragStartWidth = nil
+                isResizerBandActive = false
+                scheduleSidebarResizerCursorRelease(force: true)
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .onChanged { value in
+                        if !isResizerDragging {
+                            isResizerDragging = true
+                            sidebarDragStartWidth = sidebarWidth
+                            #if DEBUG
+                            dlog("sidebar.resizeDragStart")
+                            #endif
+                        }
+
+                        activateSidebarResizerCursor()
+                        let startWidth = sidebarDragStartWidth ?? sidebarWidth
+                        let nextWidth = max(186, min(maxSidebarWidth, startWidth + value.translation.width))
+                        withTransaction(Transaction(animation: nil)) {
+                            sidebarWidth = nextWidth
+                        }
+                    }
+                    .onEnded { _ in
+                        if isResizerDragging {
+                            isResizerDragging = false
+                            sidebarDragStartWidth = nil
+                        }
+                        activateSidebarResizerCursor()
+                        scheduleSidebarResizerCursorRelease()
+                    }
+            )
+            .modifier(SidebarResizerAccessibilityModifier(accessibilityIdentifier: accessibilityIdentifier))
+    }
+
+    private var sidebarResizerOverlay: some View {
+        GeometryReader { proxy in
+            let totalWidth = max(0, proxy.size.width)
+            let dividerX = min(max(sidebarWidth, 0), totalWidth)
+            let leadingWidth = max(0, dividerX - sidebarResizerHitWidthPerSide)
+
+            HStack(spacing: 0) {
+                Color.clear
+                    .frame(width: leadingWidth)
+                    .allowsHitTesting(false)
+
+                sidebarResizerHandleOverlay(
+                    .divider,
+                    width: sidebarResizerHitWidthPerSide * 2,
+                    accessibilityIdentifier: "SidebarResizer"
+                )
+
+                Color.clear
+                    .frame(maxWidth: .infinity)
+                    .allowsHitTesting(false)
+            }
+            .frame(width: totalWidth, height: proxy.size.height, alignment: .leading)
+        }
+    }
 
     private var sidebarView: some View {
         VerticalTabsSidebar(
@@ -420,69 +1593,10 @@ struct ContentView: View {
             lastSidebarSelectionIndex: $lastSidebarSelectionIndex
         )
         .frame(width: sidebarWidth)
-        .background(GeometryReader { proxy in
-            Color.clear
-                .preference(key: SidebarFramePreferenceKey.self, value: proxy.frame(in: .global))
-        })
-        .overlay(alignment: .trailing) {
-            Color.clear
-                .frame(width: sidebarHandleWidth)
-                .contentShape(Rectangle())
-                .accessibilityIdentifier("SidebarResizer")
-                .onHover { hovering in
-                    if hovering {
-                        if !isResizerHovering {
-                            NSCursor.resizeLeftRight.push()
-                            isResizerHovering = true
-                        }
-                    } else if isResizerHovering {
-                        if !isResizerDragging {
-                            NSCursor.pop()
-                            isResizerHovering = false
-                        }
-                    }
-                }
-                .onDisappear {
-                    if isResizerHovering || isResizerDragging {
-                        NSCursor.pop()
-                        isResizerHovering = false
-                        isResizerDragging = false
-                    }
-                }
-                .gesture(
-                    DragGesture(minimumDistance: 0, coordinateSpace: .global)
-                        .onChanged { value in
-                            if !isResizerDragging {
-                                isResizerDragging = true
-                                #if DEBUG
-                                dlog("sidebar.resizeDragStart")
-                                #endif
-                                if !isResizerHovering {
-                                    NSCursor.resizeLeftRight.push()
-                                    isResizerHovering = true
-                                }
-                            }
-                            let nextWidth = max(186, min(360, value.location.x - sidebarMinX + sidebarHandleWidth / 2))
-                            withTransaction(Transaction(animation: nil)) {
-                                sidebarWidth = nextWidth
-                            }
-                        }
-                        .onEnded { _ in
-                            if isResizerDragging {
-                                isResizerDragging = false
-                                if !isResizerHovering {
-                                    NSCursor.pop()
-                                }
-                            }
-                        }
-                )
-        }
     }
 
-    // Keep the custom workspace header bar (shows current directory).
-    private let showWorkspaceHeaderBar = true
-
-    /// Space at top of content area for the custom workspace header bar.
+    /// Space at top of content area for the titlebar. This must be at least the actual titlebar
+    /// height; otherwise controls like Bonsplit tab dragging can be interpreted as window drags.
     @State private var titlebarPadding: CGFloat = 32
 
     private var terminalContent: some View {
@@ -503,7 +1617,16 @@ struct ContentView: View {
                         workspace: tab,
                         isWorkspaceVisible: isVisible,
                         isWorkspaceInputActive: isInputActive,
-                        workspacePortalPriority: portalPriority
+                        workspacePortalPriority: portalPriority,
+                        onThemeRefreshRequest: { reason, eventId, source, payloadHex in
+                            scheduleTitlebarThemeRefreshFromWorkspace(
+                                workspaceId: tab.id,
+                                reason: reason,
+                                backgroundEventId: eventId,
+                                backgroundSource: source,
+                                notificationPayloadHex: payloadHex
+                            )
+                        }
                     )
                     .opacity(isVisible ? 1 : 0)
                     .allowsHitTesting(isSelectedWorkspace)
@@ -517,13 +1640,18 @@ struct ContentView: View {
                 .opacity(sidebarSelectionState.selection == .notifications ? 1 : 0)
                 .allowsHitTesting(sidebarSelectionState.selection == .notifications)
         }
-        .padding(.top, showWorkspaceHeaderBar ? titlebarPadding : 0)
+        .padding(.top, titlebarPadding)
         .overlay(alignment: .top) {
-            if showWorkspaceHeaderBar {
-                // Titlebar overlay is only over terminal content, not the sidebar.
-                customTitlebar
-            }
+            // Titlebar overlay is only over terminal content, not the sidebar.
+            customTitlebar
         }
+    }
+
+    private var terminalContentWithSidebarDropOverlay: some View {
+        terminalContent
+            .overlay {
+                SidebarExternalDropOverlay(draggedTabId: sidebarDraggedTabId)
+            }
     }
 
     @AppStorage("sidebarBlendMode") private var sidebarBlendMode = SidebarBlendModeOption.withinWindow.rawValue
@@ -551,19 +1679,11 @@ struct ContentView: View {
             ? Color.black.opacity(0.78)
             : Color.white.opacity(0.82)
     }
-    private var fakeTitlebarSeparatorColor: Color {
-        _ = titlebarThemeGeneration
-        let ghosttyBackground = GhosttyApp.shared.defaultBackgroundColor
-        return ghosttyBackground.isLightColor
-            ? Color.black.opacity(0.18)
-            : Color.white.opacity(0.22)
-    }
-
     private var fullscreenControls: some View {
         TitlebarControlsView(
             notificationStore: TerminalNotificationStore.shared,
             viewModel: fullscreenControlsViewModel,
-            onToggleSidebar: { AppDelegate.shared?.sidebarState?.toggle() },
+            onToggleSidebar: { sidebarState.toggle() },
             onToggleNotifications: { [fullscreenControlsViewModel] in
                 AppDelegate.shared?.toggleNotificationsPopover(
                     animated: true,
@@ -587,6 +1707,16 @@ struct ContentView: View {
                     fullscreenControls
                 }
 
+                // Draggable folder icon + focused command name
+                if let directory = focusedDirectory {
+                    DraggableFolderIcon(directory: directory)
+                }
+
+                Text(titlebarText)
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(fakeTitlebarTextColor)
+                    .lineLimit(1)
+
                 Spacer()
 
             }
@@ -604,7 +1734,7 @@ struct ContentView: View {
         .background(fakeTitlebarBackground)
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(fakeTitlebarSeparatorColor)
+                .fill(Color(nsColor: .separatorColor))
                 .frame(height: 1)
         }
     }
@@ -612,11 +1742,62 @@ struct ContentView: View {
     private func updateTitlebarText() {
         guard let selectedId = tabManager.selectedTabId,
               let tab = tabManager.tabs.first(where: { $0.id == selectedId }) else {
-            titlebarText = ""
+            if !titlebarText.isEmpty {
+                titlebarText = ""
+            }
             return
         }
         let title = tab.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        titlebarText = title
+        if titlebarText != title {
+            titlebarText = title
+        }
+    }
+
+    private func scheduleTitlebarTextRefresh() {
+        titlebarTextUpdateCoalescer.signal {
+            updateTitlebarText()
+        }
+    }
+
+    private func scheduleTitlebarThemeRefresh(
+        reason: String,
+        backgroundEventId: UInt64? = nil,
+        backgroundSource: String? = nil,
+        notificationPayloadHex: String? = nil
+    ) {
+        let previousGeneration = titlebarThemeGeneration
+        titlebarThemeGeneration &+= 1
+        if GhosttyApp.shared.backgroundLogEnabled {
+            let eventLabel = backgroundEventId.map(String.init) ?? "nil"
+            let sourceLabel = backgroundSource ?? "nil"
+            let payloadLabel = notificationPayloadHex ?? "nil"
+            GhosttyApp.shared.logBackground(
+                "titlebar theme refresh scheduled reason=\(reason) event=\(eventLabel) source=\(sourceLabel) payload=\(payloadLabel) previousGeneration=\(previousGeneration) generation=\(titlebarThemeGeneration) appBg=\(GhosttyApp.shared.defaultBackgroundColor.hexString()) appOpacity=\(String(format: "%.3f", GhosttyApp.shared.defaultBackgroundOpacity))"
+            )
+        }
+    }
+
+    private func scheduleTitlebarThemeRefreshFromWorkspace(
+        workspaceId: UUID,
+        reason: String,
+        backgroundEventId: UInt64?,
+        backgroundSource: String?,
+        notificationPayloadHex: String?
+    ) {
+        guard tabManager.selectedTabId == workspaceId else {
+            guard GhosttyApp.shared.backgroundLogEnabled else { return }
+            GhosttyApp.shared.logBackground(
+                "titlebar theme refresh skipped workspace=\(workspaceId.uuidString) selected=\(tabManager.selectedTabId?.uuidString ?? "nil") reason=\(reason)"
+            )
+            return
+        }
+
+        scheduleTitlebarThemeRefresh(
+            reason: reason,
+            backgroundEventId: backgroundEventId,
+            backgroundSource: backgroundSource,
+            notificationPayloadHex: notificationPayloadHex
+        )
     }
 
     private var focusedDirectory: String? {
@@ -636,50 +1817,71 @@ struct ContentView: View {
         return dir.isEmpty ? nil : dir
     }
 
-    var body: some View {
-        let useOverlay = sidebarBlendMode == SidebarBlendModeOption.withinWindow.rawValue
-
-        Group {
-            if useOverlay {
-                // Overlay mode: terminal extends full width, sidebar on top
-                // This allows withinWindow blur to see the terminal content
+    private var contentAndSidebarLayout: AnyView {
+        let layout: AnyView
+        if sidebarBlendMode == SidebarBlendModeOption.withinWindow.rawValue {
+            // Overlay mode: terminal extends full width, sidebar on top
+            // This allows withinWindow blur to see the terminal content
+            layout = AnyView(
                 ZStack(alignment: .leading) {
-                    terminalContent
+                    terminalContentWithSidebarDropOverlay
                         .padding(.leading, sidebarState.isVisible ? sidebarWidth : 0)
                     if sidebarState.isVisible {
                         sidebarView
                     }
                 }
-            } else {
-                // Standard HStack mode for behindWindow blur
+            )
+        } else {
+            // Standard HStack mode for behindWindow blur
+            layout = AnyView(
                 HStack(spacing: 0) {
                     if sidebarState.isVisible {
                         sidebarView
                     }
-                    terminalContent
+                    terminalContentWithSidebarDropOverlay
                 }
-            }
+            )
         }
-        .overlay(alignment: .topLeading) {
-            if isFullScreen && sidebarState.isVisible {
-                fullscreenControls
-                    .padding(.leading, 10)
-                    .padding(.top, 4)
-            }
-        }
-        .frame(minWidth: 800, minHeight: 600)
-        .background(Color.clear)
-        .onAppear {
+
+        return AnyView(
+            layout
+                .overlay(alignment: .leading) {
+                    if sidebarState.isVisible {
+                        sidebarResizerOverlay
+                            .zIndex(1000)
+                    }
+                }
+        )
+    }
+
+    var body: some View {
+        var view = AnyView(
+            contentAndSidebarLayout
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .overlay(alignment: .topLeading) {
+                    if isFullScreen && sidebarState.isVisible {
+                        fullscreenControls
+                            .padding(.leading, 10)
+                            .padding(.top, 4)
+                    }
+                }
+                .frame(minWidth: 800, minHeight: 600)
+                .background(Color.clear)
+        )
+
+        view = AnyView(view.onAppear {
             tabManager.applyWindowBackgroundForSelectedTab()
             reconcileMountedWorkspaceIds()
             previousSelectedWorkspaceId = tabManager.selectedTabId
+            installSidebarResizerPointerMonitorIfNeeded()
             if selectedTabIds.isEmpty, let selectedId = tabManager.selectedTabId {
                 selectedTabIds = [selectedId]
                 lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == selectedId }
             }
             updateTitlebarText()
-        }
-        .onChange(of: tabManager.selectedTabId) { newValue in
+        })
+
+        view = AnyView(view.onChange(of: tabManager.selectedTabId) { newValue in
 #if DEBUG
             if let snapshot = tabManager.debugCurrentWorkspaceSwitchSnapshot() {
                 let dtMs = (CACurrentMediaTime() - snapshot.startedAt) * 1000
@@ -699,8 +1901,9 @@ struct ContentView: View {
                 lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == newValue }
             }
             updateTitlebarText()
-        }
-        .onChange(of: tabManager.isWorkspaceCycleHot) { _ in
+        })
+
+        view = AnyView(view.onChange(of: tabManager.isWorkspaceCycleHot) { _ in
 #if DEBUG
             if let snapshot = tabManager.debugCurrentWorkspaceSwitchSnapshot() {
                 let dtMs = (CACurrentMediaTime() - snapshot.startedAt) * 1000
@@ -712,37 +1915,44 @@ struct ContentView: View {
             }
 #endif
             reconcileMountedWorkspaceIds()
-        }
-        .onChange(of: retiringWorkspaceId) { _ in
+        })
+
+        view = AnyView(view.onChange(of: retiringWorkspaceId) { _ in
             reconcileMountedWorkspaceIds()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .ghosttyDidSetTitle)) { notification in
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidSetTitle)) { notification in
             guard let tabId = notification.userInfo?[GhosttyNotificationKey.tabId] as? UUID,
                   tabId == tabManager.selectedTabId else { return }
-            updateTitlebarText()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .ghosttyDidFocusTab)) { _ in
+            scheduleTitlebarTextRefresh()
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidFocusTab)) { _ in
             sidebarSelectionState.selection = .tabs
-            updateTitlebarText()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .ghosttyDidFocusSurface)) { notification in
+            scheduleTitlebarTextRefresh()
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidFocusSurface)) { notification in
             guard let tabId = notification.userInfo?[GhosttyNotificationKey.tabId] as? UUID,
                   tabId == tabManager.selectedTabId else { return }
             completeWorkspaceHandoffIfNeeded(focusedTabId: tabId, reason: "focus")
-            updateTitlebarText()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .ghosttyConfigDidReload)) { _ in
-            titlebarThemeGeneration &+= 1
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { _ in
-            titlebarThemeGeneration &+= 1
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .ghosttyDidBecomeFirstResponderSurface)) { notification in
+            scheduleTitlebarTextRefresh()
+        })
+
+        view = AnyView(view.onChange(of: titlebarThemeGeneration) { oldValue, newValue in
+            guard GhosttyApp.shared.backgroundLogEnabled else { return }
+            GhosttyApp.shared.logBackground(
+                "titlebar theme refresh applied oldGeneration=\(oldValue) generation=\(newValue) appBg=\(GhosttyApp.shared.defaultBackgroundColor.hexString()) appOpacity=\(String(format: "%.3f", GhosttyApp.shared.defaultBackgroundOpacity))"
+            )
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidBecomeFirstResponderSurface)) { notification in
             guard let tabId = notification.userInfo?[GhosttyNotificationKey.tabId] as? UUID,
                   tabId == tabManager.selectedTabId else { return }
             completeWorkspaceHandoffIfNeeded(focusedTabId: tabId, reason: "first_responder")
-        }
-        .onReceive(tabManager.$tabs) { tabs in
+        })
+
+        view = AnyView(view.onReceive(tabManager.$tabs) { tabs in
             let existingIds = Set(tabs.map { $0.id })
             if let retiringWorkspaceId, !existingIds.contains(retiringWorkspaceId) {
                 self.retiringWorkspaceId = nil
@@ -764,69 +1974,180 @@ struct ContentView: View {
                     lastSidebarSelectionIndex = nil
                 }
             }
-        }
-        .onPreferenceChange(SidebarFramePreferenceKey.self) { frame in
-            sidebarMinX = frame.minX
-        }
-        .onChange(of: bgGlassTintHex) { _ in
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: SidebarDragLifecycleNotification.stateDidChange)) { notification in
+            let tabId = SidebarDragLifecycleNotification.tabId(from: notification)
+            sidebarDraggedTabId = tabId
+#if DEBUG
+            dlog(
+                "sidebar.dragState.content tab=\(debugShortWorkspaceId(tabId)) " +
+                "reason=\(SidebarDragLifecycleNotification.reason(from: notification))"
+            )
+#endif
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteToggleRequested)) { notification in
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            toggleCommandPalette()
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteRequested)) { notification in
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            openCommandPaletteCommands()
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteSwitcherRequested)) { notification in
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            openCommandPaletteSwitcher()
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteRenameTabRequested)) { notification in
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            openCommandPaletteRenameTabInput()
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteMoveSelection)) { notification in
+            guard isCommandPalettePresented else { return }
+            guard case .commands = commandPaletteMode else { return }
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            guard let delta = notification.userInfo?["delta"] as? Int, delta != 0 else { return }
+            moveCommandPaletteSelection(by: delta)
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteRenameInputInteractionRequested)) { notification in
+            guard isCommandPalettePresented else { return }
+            guard case .renameInput = commandPaletteMode else { return }
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            handleCommandPaletteRenameInputInteraction()
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteRenameInputDeleteBackwardRequested)) { notification in
+            guard isCommandPalettePresented else { return }
+            guard case .renameInput = commandPaletteMode else { return }
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            _ = handleCommandPaletteRenameDeleteBackward(modifiers: [])
+        })
+
+        view = AnyView(view.background(WindowAccessor(dedupeByWindow: false) { window in
+            MainActor.assumeIsolated {
+                let overlayController = commandPaletteWindowOverlayController(for: window)
+                overlayController.update(rootView: AnyView(commandPaletteOverlay), isVisible: isCommandPalettePresented)
+            }
+        }))
+
+        view = AnyView(view.onChange(of: bgGlassTintHex) { _ in
             updateWindowGlassTint()
-        }
-        .onChange(of: bgGlassTintOpacity) { _ in
+        })
+
+        view = AnyView(view.onChange(of: bgGlassTintOpacity) { _ in
             updateWindowGlassTint()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { notification in
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { notification in
             guard let window = notification.object as? NSWindow,
                   window === observedWindow else { return }
             isFullScreen = true
             setTitlebarControlsHidden(true, in: window)
             AppDelegate.shared?.fullscreenControlsViewModel = fullscreenControlsViewModel
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { notification in
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { notification in
             guard let window = notification.object as? NSWindow,
                   window === observedWindow else { return }
             isFullScreen = false
             setTitlebarControlsHidden(false, in: window)
             AppDelegate.shared?.fullscreenControlsViewModel = nil
-        }
-	        .ignoresSafeArea()
-	        .background(WindowAccessor { [sidebarBlendMode, bgGlassEnabled, bgGlassTintHex, bgGlassTintOpacity, showWorkspaceHeaderBar] window in
-	            window.identifier = NSUserInterfaceItemIdentifier(windowIdentifier)
-	            window.titleVisibility = .hidden
-	            window.titlebarAppearsTransparent = true
-	            // When the custom header bar is hidden, allow dragging the window from
-	            // background areas in the tab strip region.
-	            window.isMovableByWindowBackground = !showWorkspaceHeaderBar
-	            window.styleMask.insert(.fullSizeContentView)
-	            if !showWorkspaceHeaderBar {
-	                if window.toolbar != nil {
-	                    window.toolbar = nil
-	                }
-	                if !window.titlebarAccessoryViewControllers.isEmpty {
-	                    window.titlebarAccessoryViewControllers.removeAll()
-	                }
-	            }
+        })
 
-                // Track this window for fullscreen notifications
-                if observedWindow !== window {
-                    DispatchQueue.main.async {
-                        observedWindow = window
-                        isFullScreen = window.styleMask.contains(.fullScreen)
-                    }
-                }
+        view = AnyView(view.onChange(of: sidebarWidth) { _ in
+            updateSidebarResizerBandState()
+        })
 
-                // Keep content below the titlebar so drags on Bonsplit's tab bar don't
-                // get interpreted as window drags.
-                let computedTitlebarHeight = window.frame.height - window.contentLayoutRect.height
-                let nextPadding = max(28, min(72, computedTitlebarHeight))
-                if abs(titlebarPadding - nextPadding) > 0.5 {
-                    DispatchQueue.main.async {
-                        titlebarPadding = nextPadding
-                    }
+        view = AnyView(view.onChange(of: sidebarState.isVisible) { _ in
+            updateSidebarResizerBandState()
+        })
+
+        view = AnyView(view.ignoresSafeArea())
+
+        view = AnyView(view.onDisappear {
+            removeSidebarResizerPointerMonitor()
+        })
+
+        view = AnyView(view.background(WindowAccessor { [sidebarBlendMode, bgGlassEnabled, bgGlassTintHex, bgGlassTintOpacity] window in
+            window.identifier = NSUserInterfaceItemIdentifier(windowIdentifier)
+            window.titlebarAppearsTransparent = true
+            // Do not make the entire background draggable; it interferes with drag gestures
+            // like sidebar tab reordering in multi-window mode.
+            window.isMovableByWindowBackground = false
+            window.styleMask.insert(.fullSizeContentView)
+
+            // Track this window for fullscreen notifications
+            if observedWindow !== window {
+                DispatchQueue.main.async {
+                    observedWindow = window
+                    isFullScreen = window.styleMask.contains(.fullScreen)
+                    syncCommandPaletteDebugStateForObservedWindow()
+                    installSidebarResizerPointerMonitorIfNeeded()
+                    updateSidebarResizerBandState()
                 }
+            }
+
+            // Keep content below the titlebar so drags on Bonsplit's tab bar don't
+            // get interpreted as window drags.
+            let computedTitlebarHeight = window.frame.height - window.contentLayoutRect.height
+            let nextPadding = max(28, min(72, computedTitlebarHeight))
+            if abs(titlebarPadding - nextPadding) > 0.5 {
+                DispatchQueue.main.async {
+                    titlebarPadding = nextPadding
+                }
+            }
 #if DEBUG
-	            if ProcessInfo.processInfo.environment["CMUX_UI_TEST_MODE"] == "1" {
-	                UpdateLogStore.shared.append("ui test window accessor: id=\(windowIdentifier) visible=\(window.isVisible)")
-	            }
+            if ProcessInfo.processInfo.environment["CMUX_UI_TEST_MODE"] == "1" {
+                UpdateLogStore.shared.append("ui test window accessor: id=\(windowIdentifier) visible=\(window.isVisible)")
+            }
 #endif
             // Background glass: skip on macOS 26+ where NSGlassEffectView can cause blank
             // or incorrectly tinted SwiftUI content. Keep native window rendering there so
@@ -862,7 +2183,9 @@ struct ContentView: View {
                 sidebarSelectionState: sidebarSelectionState
             )
             installFileDropOverlay(on: window, tabManager: tabManager)
-        })
+        }))
+
+        return view
     }
 
     private func reconcileMountedWorkspaceIds(tabs: [Workspace]? = nil, selectedId: UUID? = nil) {
@@ -1008,6 +2331,2122 @@ struct ContentView: View {
 #endif
     }
 
+    private var commandPaletteOverlay: some View {
+        GeometryReader { proxy in
+            let maxAllowedWidth = max(340, proxy.size.width - 260)
+            let targetWidth = min(560, maxAllowedWidth)
+
+            ZStack(alignment: .top) {
+                Color.clear
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        dismissCommandPalette()
+                    }
+
+                VStack(spacing: 0) {
+                    switch commandPaletteMode {
+                    case .commands:
+                        commandPaletteCommandListView
+                    case .renameInput(let target):
+                        commandPaletteRenameInputView(target: target)
+                    case let .renameConfirm(target, proposedName):
+                        commandPaletteRenameConfirmView(target: target, proposedName: proposedName)
+                    }
+                }
+                .frame(width: targetWidth)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color(nsColor: .windowBackgroundColor).opacity(0.98))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.24), radius: 10, x: 0, y: 5)
+                .padding(.top, 40)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .onExitCommand {
+            dismissCommandPalette()
+        }
+        .zIndex(2000)
+    }
+
+    private var commandPaletteCommandListView: some View {
+        let visibleResults = Array(commandPaletteResults)
+        let selectedIndex = commandPaletteSelectedIndex(resultCount: visibleResults.count)
+        let commandPaletteListMaxHeight: CGFloat = 216
+        let commandPaletteRowHeight: CGFloat = 24
+        let commandPaletteEmptyStateHeight: CGFloat = 44
+        let commandPaletteListContentHeight = visibleResults.isEmpty
+            ? commandPaletteEmptyStateHeight
+            : CGFloat(visibleResults.count) * commandPaletteRowHeight
+        let commandPaletteListHeight = min(commandPaletteListMaxHeight, commandPaletteListContentHeight)
+        return VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                TextField(commandPaletteSearchPlaceholder, text: $commandPaletteQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, weight: .regular))
+                    .tint(.white)
+                    .focused($isCommandPaletteSearchFocused)
+                    .onSubmit {
+                        runSelectedCommandPaletteResult(visibleResults: visibleResults)
+                    }
+                    .backport.onKeyPress(.downArrow) { _ in
+                        moveCommandPaletteSelection(by: 1)
+                        return .handled
+                    }
+                    .backport.onKeyPress(.upArrow) { _ in
+                        moveCommandPaletteSelection(by: -1)
+                        return .handled
+                    }
+                    .backport.onKeyPress("n") { modifiers in
+                        handleCommandPaletteControlNavigationKey(modifiers: modifiers, delta: 1)
+                    }
+                    .backport.onKeyPress("p") { modifiers in
+                        handleCommandPaletteControlNavigationKey(modifiers: modifiers, delta: -1)
+                    }
+                    .backport.onKeyPress("j") { modifiers in
+                        handleCommandPaletteControlNavigationKey(modifiers: modifiers, delta: 1)
+                    }
+                    .backport.onKeyPress("k") { modifiers in
+                        handleCommandPaletteControlNavigationKey(modifiers: modifiers, delta: -1)
+                    }
+
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+
+            Divider()
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        if visibleResults.isEmpty {
+                            Text(commandPaletteEmptyStateText)
+                                .font(.system(size: 13, weight: .regular))
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 12)
+                        } else {
+                            ForEach(Array(visibleResults.enumerated()), id: \.element.id) { index, result in
+                                let isSelected = index == selectedIndex
+                                let isHovered = commandPaletteHoveredResultIndex == index
+                                let rowBackground: Color = isSelected
+                                    ? Color.accentColor.opacity(0.12)
+                                    : (isHovered ? Color.primary.opacity(0.08) : .clear)
+
+                                Button {
+                                    runCommandPaletteCommand(result.command)
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        commandPaletteHighlightedTitleText(
+                                            result.command.title,
+                                            matchedIndices: result.titleMatchIndices
+                                        )
+                                            .font(.system(size: 13, weight: .regular))
+                                            .lineLimit(1)
+                                        Spacer()
+
+                                        if let trailingLabel = commandPaletteTrailingLabel(for: result.command) {
+                                            switch trailingLabel.style {
+                                            case .shortcut:
+                                                Text(trailingLabel.text)
+                                                    .font(.system(size: 11, weight: .medium))
+                                                    .foregroundStyle(.secondary)
+                                                    .padding(.horizontal, 4)
+                                                    .padding(.vertical, 1)
+                                                    .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                                            case .kind:
+                                                Text(trailingLabel.text)
+                                                    .font(.system(size: 11, weight: .regular))
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                            }
+                                        }
+                                    }
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(rowBackground)
+                                    .background(
+                                        GeometryReader { geometry in
+                                            Color.clear.preference(
+                                                key: CommandPaletteRowFramePreferenceKey.self,
+                                                value: [index: geometry.frame(in: .named("commandPaletteListScroll"))]
+                                            )
+                                        }
+                                    )
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .id(index)
+                                .onHover { hovering in
+                                    if hovering {
+                                        commandPaletteHoveredResultIndex = index
+                                    } else if commandPaletteHoveredResultIndex == index {
+                                        commandPaletteHoveredResultIndex = nil
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Force a fresh row tree per query so rendered labels/actions stay in lockstep.
+                    .id(commandPaletteQuery)
+                }
+                .coordinateSpace(name: "commandPaletteListScroll")
+                .frame(height: commandPaletteListHeight)
+                .onChange(of: commandPaletteSelectedResultIndex) { _ in
+                    guard !visibleResults.isEmpty else { return }
+                    let index = commandPaletteSelectedIndex(resultCount: visibleResults.count)
+                    let previousIndex = commandPaletteLastSelectionIndex
+                    defer { commandPaletteLastSelectionIndex = index }
+
+                    guard let anchorDecision = Self.commandPaletteScrollAnchor(
+                        selectedIndex: index,
+                        previousIndex: previousIndex,
+                        resultCount: visibleResults.count,
+                        selectedFrame: commandPaletteRowFrames[index],
+                        viewportHeight: commandPaletteListHeight,
+                        contentHeight: commandPaletteListContentHeight
+                    ) else { return }
+
+                    let anchor: UnitPoint
+                    switch anchorDecision {
+                    case .top:
+                        anchor = .top
+                    case .bottom:
+                        anchor = .bottom
+                    }
+                    DispatchQueue.main.async {
+                        withAnimation(.easeOut(duration: 0.1)) {
+                            proxy.scrollTo(index, anchor: anchor)
+                        }
+                    }
+                }
+                .onChange(of: visibleResults.count) { _ in
+                    commandPaletteLastSelectionIndex = commandPaletteSelectedIndex(resultCount: visibleResults.count)
+                }
+                .onPreferenceChange(CommandPaletteRowFramePreferenceKey.self) { frames in
+                    commandPaletteRowFrames = frames
+                    guard !visibleResults.isEmpty else { return }
+                    let index = commandPaletteSelectedIndex(resultCount: visibleResults.count)
+                    guard let anchorDecision = Self.commandPaletteEdgeVisibilityCorrectionAnchor(
+                        selectedIndex: index,
+                        resultCount: visibleResults.count,
+                        selectedFrame: frames[index],
+                        viewportHeight: commandPaletteListHeight,
+                        contentHeight: commandPaletteListContentHeight
+                    ) else { return }
+                    let anchor: UnitPoint = anchorDecision == .top ? .top : .bottom
+                    DispatchQueue.main.async {
+                        withAnimation(.easeOut(duration: 0.08)) {
+                            proxy.scrollTo(index, anchor: anchor)
+                        }
+                    }
+                }
+            }
+
+            // Keep Esc-to-close behavior without showing footer controls.
+            Button(action: { dismissCommandPalette() }) {
+                EmptyView()
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.cancelAction)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            .accessibilityHidden(true)
+        }
+        .onAppear {
+            commandPaletteHoveredResultIndex = nil
+            commandPaletteLastSelectionIndex = commandPaletteSelectedResultIndex
+            commandPaletteRowFrames = [:]
+            resetCommandPaletteSearchFocus()
+        }
+        .onChange(of: commandPaletteQuery) { _ in
+            commandPaletteSelectedResultIndex = 0
+            commandPaletteHoveredResultIndex = nil
+            commandPaletteLastSelectionIndex = 0
+            commandPaletteRowFrames = [:]
+            syncCommandPaletteDebugStateForObservedWindow()
+        }
+        .onChange(of: visibleResults.count) { _ in
+            commandPaletteSelectedResultIndex = commandPaletteSelectedIndex(resultCount: visibleResults.count)
+            commandPaletteLastSelectionIndex = commandPaletteSelectedResultIndex
+            if let hoveredIndex = commandPaletteHoveredResultIndex, hoveredIndex >= visibleResults.count {
+                commandPaletteHoveredResultIndex = nil
+            }
+            syncCommandPaletteDebugStateForObservedWindow()
+        }
+        .onChange(of: commandPaletteSelectedResultIndex) { _ in
+            syncCommandPaletteDebugStateForObservedWindow()
+        }
+    }
+
+    private func commandPaletteRenameInputView(target: CommandPaletteRenameTarget) -> some View {
+        VStack(spacing: 0) {
+            TextField(target.placeholder, text: $commandPaletteRenameDraft)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13, weight: .regular))
+                .tint(.white)
+                .focused($isCommandPaletteRenameFocused)
+                .backport.onKeyPress(.delete) { modifiers in
+                    handleCommandPaletteRenameDeleteBackward(modifiers: modifiers)
+                }
+                .onSubmit {
+                    continueRenameFlow(target: target)
+                }
+                .onTapGesture {
+                    handleCommandPaletteRenameInputInteraction()
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 7)
+
+            Divider()
+
+            Text("Enter a \(renameTargetNoun(target)) name. Press Enter to rename, Escape to cancel.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
+
+            Button(action: {
+                continueRenameFlow(target: target)
+            }) {
+                EmptyView()
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.defaultAction)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            .accessibilityHidden(true)
+        }
+        .onAppear {
+            resetCommandPaletteRenameFocus()
+        }
+    }
+
+    private func commandPaletteRenameConfirmView(
+        target: CommandPaletteRenameTarget,
+        proposedName: String
+    ) -> some View {
+        let trimmedName = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextName = trimmedName.isEmpty ? "(clear custom name)" : trimmedName
+
+        return VStack(spacing: 0) {
+            Text(nextName)
+                .font(.system(size: 13, weight: .regular))
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 7)
+
+            Divider()
+
+            Text("Press Enter to apply this \(renameTargetNoun(target)) name, or Escape to cancel.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
+
+            Button(action: {
+                applyRenameFlow(target: target, proposedName: proposedName)
+            }) {
+                EmptyView()
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.defaultAction)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            .accessibilityHidden(true)
+        }
+    }
+
+    private func renameTargetNoun(_ target: CommandPaletteRenameTarget) -> String {
+        switch target.kind {
+        case .workspace:
+            return "workspace"
+        case .tab:
+            return "tab"
+        }
+    }
+
+    private var commandPaletteListScope: CommandPaletteListScope {
+        if commandPaletteQuery.hasPrefix(Self.commandPaletteCommandsPrefix) {
+            return .commands
+        }
+        return .switcher
+    }
+
+    private var commandPaletteSearchPlaceholder: String {
+        switch commandPaletteListScope {
+        case .commands:
+            return "Type a command"
+        case .switcher:
+            return "Search workspaces and tabs"
+        }
+    }
+
+    private var commandPaletteEmptyStateText: String {
+        switch commandPaletteListScope {
+        case .commands:
+            return "No commands match your search."
+        case .switcher:
+            return "No workspaces or tabs match your search."
+        }
+    }
+
+    private var commandPaletteQueryForMatching: String {
+        switch commandPaletteListScope {
+        case .commands:
+            let suffix = String(commandPaletteQuery.dropFirst(Self.commandPaletteCommandsPrefix.count))
+            return suffix.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .switcher:
+            return commandPaletteQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
+    private var commandPaletteEntries: [CommandPaletteCommand] {
+        switch commandPaletteListScope {
+        case .commands:
+            return commandPaletteCommands()
+        case .switcher:
+            return commandPaletteSwitcherEntries()
+        }
+    }
+
+    private var commandPaletteResults: [CommandPaletteSearchResult] {
+        let entries = commandPaletteEntries
+        let query = commandPaletteQueryForMatching
+        let queryIsEmpty = query.isEmpty
+
+        let results: [CommandPaletteSearchResult] = queryIsEmpty
+            ? entries.map { entry in
+                CommandPaletteSearchResult(
+                    command: entry,
+                    score: commandPaletteHistoryBoost(for: entry.id, queryIsEmpty: true),
+                    titleMatchIndices: []
+                )
+            }
+            : entries.compactMap { entry in
+                guard let fuzzyScore = CommandPaletteFuzzyMatcher.score(query: query, candidates: entry.searchableTexts) else {
+                    return nil
+                }
+                return CommandPaletteSearchResult(
+                    command: entry,
+                    score: fuzzyScore + commandPaletteHistoryBoost(for: entry.id, queryIsEmpty: false),
+                    titleMatchIndices: CommandPaletteFuzzyMatcher.matchCharacterIndices(
+                        query: query,
+                        candidate: entry.title
+                    )
+                )
+            }
+
+        return results
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score { return lhs.score > rhs.score }
+                if lhs.command.rank != rhs.command.rank { return lhs.command.rank < rhs.command.rank }
+                return lhs.command.title.localizedCaseInsensitiveCompare(rhs.command.title) == .orderedAscending
+            }
+    }
+
+    private func commandPaletteHighlightedTitleText(_ title: String, matchedIndices: Set<Int>) -> Text {
+        guard !matchedIndices.isEmpty else {
+            return Text(title).foregroundColor(.primary)
+        }
+
+        let chars = Array(title)
+        var index = 0
+        var result = Text("")
+
+        while index < chars.count {
+            let isMatched = matchedIndices.contains(index)
+            var end = index + 1
+            while end < chars.count, matchedIndices.contains(end) == isMatched {
+                end += 1
+            }
+
+            let segment = String(chars[index..<end])
+            if isMatched {
+                result = result + Text(segment).foregroundColor(.blue)
+            } else {
+                result = result + Text(segment).foregroundColor(.primary)
+            }
+            index = end
+        }
+
+        return result
+    }
+
+    private func commandPaletteTrailingLabel(for command: CommandPaletteCommand) -> CommandPaletteTrailingLabel? {
+        if let shortcutHint = command.shortcutHint {
+            return CommandPaletteTrailingLabel(text: shortcutHint, style: .shortcut)
+        }
+
+        guard commandPaletteListScope == .switcher else { return nil }
+        if command.id.hasPrefix("switcher.workspace.") {
+            return CommandPaletteTrailingLabel(text: "Workspace", style: .kind)
+        }
+        if command.id.hasPrefix("switcher.surface.") {
+            return CommandPaletteTrailingLabel(text: "Surface", style: .kind)
+        }
+        return nil
+    }
+
+    private func commandPaletteSwitcherEntries() -> [CommandPaletteCommand] {
+        let windowContexts = commandPaletteSwitcherWindowContexts()
+        guard !windowContexts.isEmpty else { return [] }
+
+        var entries: [CommandPaletteCommand] = []
+        let estimatedCount = windowContexts.reduce(0) { partial, context in
+            partial + max(1, context.tabManager.tabs.count) * 4
+        }
+        entries.reserveCapacity(estimatedCount)
+        var nextRank = 0
+
+        for context in windowContexts {
+            var workspaces = context.tabManager.tabs
+            guard !workspaces.isEmpty else { continue }
+
+            let selectedWorkspaceId = context.selectedWorkspaceId ?? context.tabManager.selectedTabId
+            if let selectedWorkspaceId,
+               let selectedIndex = workspaces.firstIndex(where: { $0.id == selectedWorkspaceId }) {
+                let selectedWorkspace = workspaces.remove(at: selectedIndex)
+                workspaces.insert(selectedWorkspace, at: 0)
+            }
+
+            let windowId = context.windowId
+            let windowTabManager = context.tabManager
+            let windowKeywords = commandPaletteWindowKeywords(windowLabel: context.windowLabel)
+            for workspace in workspaces {
+                let workspaceName = workspaceDisplayName(workspace)
+                let workspaceCommandId = "switcher.workspace.\(workspace.id.uuidString.lowercased())"
+                let workspaceKeywords = CommandPaletteSwitcherSearchIndexer.keywords(
+                    baseKeywords: [
+                        "workspace",
+                        "switch",
+                        "go",
+                        "open",
+                        workspaceName
+                    ] + windowKeywords,
+                    metadata: commandPaletteWorkspaceSearchMetadata(for: workspace),
+                    detail: .workspace
+                )
+                let workspaceId = workspace.id
+                entries.append(
+                    CommandPaletteCommand(
+                        id: workspaceCommandId,
+                        rank: nextRank,
+                        title: workspaceName,
+                        subtitle: commandPaletteSwitcherSubtitle(base: "Workspace", windowLabel: context.windowLabel),
+                        shortcutHint: nil,
+                        keywords: workspaceKeywords,
+                        dismissOnRun: true,
+                        action: {
+                            focusCommandPaletteSwitcherTarget(
+                                windowId: windowId,
+                                tabManager: windowTabManager,
+                                workspaceId: workspaceId,
+                                panelId: nil
+                            )
+                        }
+                    )
+                )
+                nextRank += 1
+
+                var orderedPanelIds = workspace.sidebarOrderedPanelIds()
+                if let focusedPanelId = workspace.focusedPanelId,
+                   let focusedIndex = orderedPanelIds.firstIndex(of: focusedPanelId) {
+                    orderedPanelIds.remove(at: focusedIndex)
+                    orderedPanelIds.insert(focusedPanelId, at: 0)
+                }
+
+                for panelId in orderedPanelIds {
+                    guard let panel = workspace.panels[panelId] else { continue }
+                    let panelTitle = panelDisplayName(workspace: workspace, panelId: panelId, fallback: panel.displayTitle)
+                    let typeLabel: String = (panel.panelType == .browser) ? "Browser" : "Terminal"
+                    let panelKeywords = CommandPaletteSwitcherSearchIndexer.keywords(
+                        baseKeywords: [
+                            "tab",
+                            "surface",
+                            "panel",
+                            "switch",
+                            "go",
+                            workspaceName,
+                            panelTitle,
+                            typeLabel.lowercased()
+                        ] + windowKeywords,
+                        metadata: commandPalettePanelSearchMetadata(in: workspace, panelId: panelId)
+                    )
+                    entries.append(
+                        CommandPaletteCommand(
+                            id: "switcher.surface.\(workspace.id.uuidString.lowercased()).\(panelId.uuidString.lowercased())",
+                            rank: nextRank,
+                            title: panelTitle,
+                            subtitle: commandPaletteSwitcherSubtitle(
+                                base: "\(typeLabel) • \(workspaceName)",
+                                windowLabel: context.windowLabel
+                            ),
+                            shortcutHint: nil,
+                            keywords: panelKeywords,
+                            dismissOnRun: true,
+                            action: {
+                                focusCommandPaletteSwitcherTarget(
+                                    windowId: windowId,
+                                    tabManager: windowTabManager,
+                                    workspaceId: workspaceId,
+                                    panelId: panelId
+                                )
+                            }
+                        )
+                    )
+                    nextRank += 1
+                }
+            }
+        }
+
+        return entries
+    }
+
+    private func commandPaletteSwitcherWindowContexts() -> [CommandPaletteSwitcherWindowContext] {
+        let fallback = CommandPaletteSwitcherWindowContext(
+            windowId: windowId,
+            tabManager: tabManager,
+            selectedWorkspaceId: tabManager.selectedTabId,
+            windowLabel: nil
+        )
+
+        guard let appDelegate = AppDelegate.shared else { return [fallback] }
+        let summaries = appDelegate.listMainWindowSummaries()
+        guard !summaries.isEmpty else { return [fallback] }
+
+        let orderedSummaries = summaries.sorted { lhs, rhs in
+            let lhsIsCurrent = lhs.windowId == windowId
+            let rhsIsCurrent = rhs.windowId == windowId
+            if lhsIsCurrent != rhsIsCurrent { return lhsIsCurrent }
+            if lhs.isKeyWindow != rhs.isKeyWindow { return lhs.isKeyWindow }
+            if lhs.isVisible != rhs.isVisible { return lhs.isVisible }
+            return lhs.windowId.uuidString < rhs.windowId.uuidString
+        }
+
+        var windowLabelById: [UUID: String] = [:]
+        if orderedSummaries.count > 1 {
+            for (index, summary) in orderedSummaries.enumerated() where summary.windowId != windowId {
+                windowLabelById[summary.windowId] = "Window \(index + 1)"
+            }
+        }
+
+        var contexts: [CommandPaletteSwitcherWindowContext] = []
+        var seenWindowIds: Set<UUID> = []
+        for summary in orderedSummaries {
+            guard let manager = appDelegate.tabManagerFor(windowId: summary.windowId) else { continue }
+            guard seenWindowIds.insert(summary.windowId).inserted else { continue }
+            contexts.append(
+                CommandPaletteSwitcherWindowContext(
+                    windowId: summary.windowId,
+                    tabManager: manager,
+                    selectedWorkspaceId: summary.selectedWorkspaceId,
+                    windowLabel: windowLabelById[summary.windowId]
+                )
+            )
+        }
+
+        if contexts.isEmpty {
+            return [fallback]
+        }
+        return contexts
+    }
+
+    private func commandPaletteSwitcherSubtitle(base: String, windowLabel: String?) -> String {
+        guard let windowLabel else { return base }
+        return "\(base) • \(windowLabel)"
+    }
+
+    private func commandPaletteWindowKeywords(windowLabel: String?) -> [String] {
+        guard let windowLabel else { return [] }
+        return ["window", windowLabel.lowercased()]
+    }
+
+    private func focusCommandPaletteSwitcherTarget(
+        windowId: UUID,
+        tabManager: TabManager,
+        workspaceId: UUID,
+        panelId: UUID?
+    ) {
+        _ = AppDelegate.shared?.focusMainWindow(windowId: windowId)
+        if let panelId {
+            tabManager.focusTab(workspaceId, surfaceId: panelId, suppressFlash: true)
+        } else {
+            tabManager.focusTab(workspaceId, suppressFlash: true)
+        }
+    }
+
+    private func commandPaletteWorkspaceSearchMetadata(for workspace: Workspace) -> CommandPaletteSwitcherSearchMetadata {
+        // Keep workspace rows coarse so surface rows win for directory/branch-specific queries.
+        let directories = [workspace.currentDirectory]
+        let branches = [workspace.gitBranch?.branch].compactMap { $0 }
+        let ports = workspace.listeningPorts
+        return CommandPaletteSwitcherSearchMetadata(
+            directories: directories,
+            branches: branches,
+            ports: ports
+        )
+    }
+
+    private func commandPalettePanelSearchMetadata(in workspace: Workspace, panelId: UUID) -> CommandPaletteSwitcherSearchMetadata {
+        var directories: [String] = []
+        if let directory = workspace.panelDirectories[panelId] {
+            directories.append(directory)
+        } else if workspace.focusedPanelId == panelId {
+            directories.append(workspace.currentDirectory)
+        }
+
+        var branches: [String] = []
+        if let branch = workspace.panelGitBranches[panelId]?.branch {
+            branches.append(branch)
+        } else if workspace.focusedPanelId == panelId, let branch = workspace.gitBranch?.branch {
+            branches.append(branch)
+        }
+
+        var ports = workspace.surfaceListeningPorts[panelId] ?? []
+        if ports.isEmpty, workspace.panels.count == 1 {
+            ports = workspace.listeningPorts
+        }
+
+        return CommandPaletteSwitcherSearchMetadata(
+            directories: directories,
+            branches: branches,
+            ports: ports
+        )
+    }
+
+    private func commandPaletteCommands() -> [CommandPaletteCommand] {
+        let context = commandPaletteContextSnapshot()
+        let contributions = commandPaletteCommandContributions()
+        var handlerRegistry = CommandPaletteHandlerRegistry()
+        registerCommandPaletteHandlers(&handlerRegistry)
+
+        var commands: [CommandPaletteCommand] = []
+        commands.reserveCapacity(contributions.count)
+        var nextRank = 0
+
+        for contribution in contributions {
+            guard contribution.when(context), contribution.enablement(context) else { continue }
+            guard let action = handlerRegistry.handler(for: contribution.commandId) else {
+                assertionFailure("No command palette handler registered for \(contribution.commandId)")
+                continue
+            }
+            commands.append(
+                CommandPaletteCommand(
+                    id: contribution.commandId,
+                    rank: nextRank,
+                    title: contribution.title(context),
+                    subtitle: contribution.subtitle(context),
+                    shortcutHint: commandPaletteShortcutHint(for: contribution, context: context),
+                    keywords: contribution.keywords,
+                    dismissOnRun: contribution.dismissOnRun,
+                    action: action
+                )
+            )
+            nextRank += 1
+        }
+
+        return commands
+    }
+
+    private func commandPaletteShortcutHint(
+        for contribution: CommandPaletteCommandContribution,
+        context: CommandPaletteContextSnapshot
+    ) -> String? {
+        // Preserve browser reload semantics for Cmd+R when a browser tab is focused.
+        if contribution.commandId == "palette.renameTab",
+           context.bool(CommandPaletteContextKeys.panelIsBrowser) {
+            return nil
+        }
+        if let action = commandPaletteShortcutAction(for: contribution.commandId) {
+            return KeyboardShortcutSettings.shortcut(for: action).displayString
+        }
+        if let staticShortcut = commandPaletteStaticShortcutHint(for: contribution.commandId) {
+            return staticShortcut
+        }
+        return contribution.shortcutHint
+    }
+
+    private func commandPaletteShortcutAction(for commandId: String) -> KeyboardShortcutSettings.Action? {
+        switch commandId {
+        case "palette.newWorkspace":
+            return .newTab
+        case "palette.newWindow":
+            return .newWindow
+        case "palette.newTerminalTab":
+            return .newSurface
+        case "palette.newBrowserTab":
+            return .openBrowser
+        case "palette.closeWindow":
+            return .closeWindow
+        case "palette.toggleSidebar":
+            return .toggleSidebar
+        case "palette.showNotifications":
+            return .showNotifications
+        case "palette.jumpUnread":
+            return .jumpToUnread
+        case "palette.renameTab":
+            return .renameTab
+        case "palette.renameWorkspace":
+            return .renameWorkspace
+        case "palette.nextWorkspace":
+            return .nextSidebarTab
+        case "palette.previousWorkspace":
+            return .prevSidebarTab
+        case "palette.nextTabInPane":
+            return .nextSurface
+        case "palette.previousTabInPane":
+            return .prevSurface
+        case "palette.browserToggleDevTools":
+            return .toggleBrowserDeveloperTools
+        case "palette.browserConsole":
+            return .showBrowserJavaScriptConsole
+        case "palette.browserSplitRight", "palette.terminalSplitBrowserRight":
+            return .splitBrowserRight
+        case "palette.browserSplitDown", "palette.terminalSplitBrowserDown":
+            return .splitBrowserDown
+        case "palette.terminalSplitRight":
+            return .splitRight
+        case "palette.terminalSplitDown":
+            return .splitDown
+        default:
+            return nil
+        }
+    }
+
+    private func commandPaletteStaticShortcutHint(for commandId: String) -> String? {
+        switch commandId {
+        case "palette.closeTab":
+            return "⌘W"
+        case "palette.closeWorkspace":
+            return "⌘⇧W"
+        case "palette.reopenClosedBrowserTab":
+            return "⌘⇧T"
+        case "palette.openSettings":
+            return "⌘,"
+        case "palette.browserBack":
+            return "⌘["
+        case "palette.browserForward":
+            return "⌘]"
+        case "palette.browserReload":
+            return "⌘R"
+        case "palette.browserFocusAddressBar":
+            return "⌘L"
+        case "palette.browserZoomIn":
+            return "⌘="
+        case "palette.browserZoomOut":
+            return "⌘-"
+        case "palette.browserZoomReset":
+            return "⌘0"
+        case "palette.terminalFind":
+            return "⌘F"
+        case "palette.terminalFindNext":
+            return "⌘G"
+        case "palette.terminalFindPrevious":
+            return "⌘⇧G"
+        case "palette.terminalHideFind":
+            return "⌘⇧F"
+        case "palette.terminalUseSelectionForFind":
+            return "⌘E"
+        default:
+            return nil
+        }
+    }
+
+    private func commandPaletteContextSnapshot() -> CommandPaletteContextSnapshot {
+        var snapshot = CommandPaletteContextSnapshot()
+
+        if let workspace = tabManager.selectedWorkspace {
+            snapshot.setBool(CommandPaletteContextKeys.hasWorkspace, true)
+            snapshot.setString(CommandPaletteContextKeys.workspaceName, workspaceDisplayName(workspace))
+            snapshot.setBool(CommandPaletteContextKeys.workspaceHasCustomName, workspace.customTitle != nil)
+            snapshot.setBool(CommandPaletteContextKeys.workspaceShouldPin, !workspace.isPinned)
+        }
+
+        if let panelContext = focusedPanelContext {
+            let workspace = panelContext.workspace
+            let panelId = panelContext.panelId
+            snapshot.setBool(CommandPaletteContextKeys.hasFocusedPanel, true)
+            snapshot.setString(
+                CommandPaletteContextKeys.panelName,
+                panelDisplayName(workspace: workspace, panelId: panelId, fallback: panelContext.panel.displayTitle)
+            )
+            snapshot.setBool(CommandPaletteContextKeys.panelIsBrowser, panelContext.panel.panelType == .browser)
+            snapshot.setBool(CommandPaletteContextKeys.panelIsTerminal, panelContext.panel.panelType == .terminal)
+            snapshot.setBool(CommandPaletteContextKeys.panelHasCustomName, workspace.panelCustomTitles[panelId] != nil)
+            snapshot.setBool(CommandPaletteContextKeys.panelShouldPin, !workspace.isPanelPinned(panelId))
+            let hasUnread = workspace.manualUnreadPanelIds.contains(panelId)
+                || notificationStore.hasUnreadNotification(forTabId: workspace.id, surfaceId: panelId)
+            snapshot.setBool(CommandPaletteContextKeys.panelHasUnread, hasUnread)
+        }
+
+        if case .updateAvailable = updateViewModel.effectiveState {
+            snapshot.setBool(CommandPaletteContextKeys.updateHasAvailable, true)
+        }
+
+        return snapshot
+    }
+
+    private func commandPaletteCommandContributions() -> [CommandPaletteCommandContribution] {
+        func constant(_ value: String) -> (CommandPaletteContextSnapshot) -> String {
+            { _ in value }
+        }
+
+        func workspaceSubtitle(_ context: CommandPaletteContextSnapshot) -> String {
+            let name = context.string(CommandPaletteContextKeys.workspaceName) ?? "Workspace"
+            return "Workspace • \(name)"
+        }
+
+        func panelSubtitle(_ context: CommandPaletteContextSnapshot) -> String {
+            let name = context.string(CommandPaletteContextKeys.panelName) ?? "Tab"
+            return "Tab • \(name)"
+        }
+
+        func browserPanelSubtitle(_ context: CommandPaletteContextSnapshot) -> String {
+            let name = context.string(CommandPaletteContextKeys.panelName) ?? "Tab"
+            return "Browser • \(name)"
+        }
+
+        func terminalPanelSubtitle(_ context: CommandPaletteContextSnapshot) -> String {
+            let name = context.string(CommandPaletteContextKeys.panelName) ?? "Tab"
+            return "Terminal • \(name)"
+        }
+
+        var contributions: [CommandPaletteCommandContribution] = []
+
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.newWorkspace",
+                title: constant("New Workspace"),
+                subtitle: constant("Workspace"),
+                keywords: ["create", "new", "workspace"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.newWindow",
+                title: constant("New Window"),
+                subtitle: constant("Window"),
+                keywords: ["create", "new", "window"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.newTerminalTab",
+                title: constant("New Tab (Terminal)"),
+                subtitle: constant("Tab"),
+                shortcutHint: "⌘T",
+                keywords: ["new", "terminal", "tab"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.newBrowserTab",
+                title: constant("New Tab (Browser)"),
+                subtitle: constant("Tab"),
+                shortcutHint: "⌘⇧L",
+                keywords: ["new", "browser", "tab", "web"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.closeTab",
+                title: constant("Close Tab"),
+                subtitle: constant("Tab"),
+                shortcutHint: "⌘W",
+                keywords: ["close", "tab"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.closeWorkspace",
+                title: constant("Close Workspace"),
+                subtitle: constant("Workspace"),
+                shortcutHint: "⌘⇧W",
+                keywords: ["close", "workspace"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.closeWindow",
+                title: constant("Close Window"),
+                subtitle: constant("Window"),
+                keywords: ["close", "window"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.reopenClosedBrowserTab",
+                title: constant("Reopen Closed Browser Tab"),
+                subtitle: constant("Browser"),
+                shortcutHint: "⌘⇧T",
+                keywords: ["reopen", "closed", "browser"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.toggleSidebar",
+                title: constant("Toggle Sidebar"),
+                subtitle: constant("Layout"),
+                keywords: ["toggle", "sidebar", "layout"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.showNotifications",
+                title: constant("Show Notifications"),
+                subtitle: constant("Notifications"),
+                keywords: ["notifications", "inbox"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.jumpUnread",
+                title: constant("Jump to Latest Unread"),
+                subtitle: constant("Notifications"),
+                keywords: ["jump", "unread", "notification"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.openSettings",
+                title: constant("Open Settings"),
+                subtitle: constant("Global"),
+                shortcutHint: "⌘,",
+                keywords: ["settings", "preferences"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.checkForUpdates",
+                title: constant("Check for Updates"),
+                subtitle: constant("Global"),
+                keywords: ["update", "upgrade", "release"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.applyUpdateIfAvailable",
+                title: constant("Apply Update (If Available)"),
+                subtitle: constant("Global"),
+                keywords: ["apply", "install", "update", "available"],
+                when: { $0.bool(CommandPaletteContextKeys.updateHasAvailable) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.attemptUpdate",
+                title: constant("Attempt Update"),
+                subtitle: constant("Global"),
+                keywords: ["attempt", "check", "update", "upgrade", "release"]
+            )
+        )
+
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.renameWorkspace",
+                title: constant("Rename Workspace…"),
+                subtitle: workspaceSubtitle,
+                keywords: ["rename", "workspace", "title"],
+                dismissOnRun: false,
+                when: { $0.bool(CommandPaletteContextKeys.hasWorkspace) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.clearWorkspaceName",
+                title: constant("Clear Workspace Name"),
+                subtitle: workspaceSubtitle,
+                keywords: ["clear", "workspace", "name"],
+                when: {
+                    $0.bool(CommandPaletteContextKeys.hasWorkspace)
+                        && $0.bool(CommandPaletteContextKeys.workspaceHasCustomName)
+                }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.toggleWorkspacePin",
+                title: { context in
+                    context.bool(CommandPaletteContextKeys.workspaceShouldPin) ? "Pin Workspace" : "Unpin Workspace"
+                },
+                subtitle: workspaceSubtitle,
+                keywords: ["workspace", "pin", "pinned"],
+                when: { $0.bool(CommandPaletteContextKeys.hasWorkspace) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.nextWorkspace",
+                title: constant("Next Workspace"),
+                subtitle: constant("Workspace Navigation"),
+                keywords: ["next", "workspace", "navigate"],
+                when: { $0.bool(CommandPaletteContextKeys.hasWorkspace) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.previousWorkspace",
+                title: constant("Previous Workspace"),
+                subtitle: constant("Workspace Navigation"),
+                keywords: ["previous", "workspace", "navigate"],
+                when: { $0.bool(CommandPaletteContextKeys.hasWorkspace) }
+            )
+        )
+
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.renameTab",
+                title: constant("Rename Tab…"),
+                subtitle: panelSubtitle,
+                keywords: ["rename", "tab", "title"],
+                dismissOnRun: false,
+                when: { $0.bool(CommandPaletteContextKeys.hasFocusedPanel) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.clearTabName",
+                title: constant("Clear Tab Name"),
+                subtitle: panelSubtitle,
+                keywords: ["clear", "tab", "name"],
+                when: {
+                    $0.bool(CommandPaletteContextKeys.hasFocusedPanel)
+                        && $0.bool(CommandPaletteContextKeys.panelHasCustomName)
+                }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.toggleTabPin",
+                title: { context in
+                    context.bool(CommandPaletteContextKeys.panelShouldPin) ? "Pin Tab" : "Unpin Tab"
+                },
+                subtitle: panelSubtitle,
+                keywords: ["tab", "pin", "pinned"],
+                when: { $0.bool(CommandPaletteContextKeys.hasFocusedPanel) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.toggleTabUnread",
+                title: { context in
+                    context.bool(CommandPaletteContextKeys.panelHasUnread) ? "Mark Tab as Read" : "Mark Tab as Unread"
+                },
+                subtitle: panelSubtitle,
+                keywords: ["tab", "read", "unread", "notification"],
+                when: { $0.bool(CommandPaletteContextKeys.hasFocusedPanel) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.nextTabInPane",
+                title: constant("Next Tab in Pane"),
+                subtitle: constant("Tab Navigation"),
+                keywords: ["next", "tab", "pane"],
+                when: { $0.bool(CommandPaletteContextKeys.hasFocusedPanel) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.previousTabInPane",
+                title: constant("Previous Tab in Pane"),
+                subtitle: constant("Tab Navigation"),
+                keywords: ["previous", "tab", "pane"],
+                when: { $0.bool(CommandPaletteContextKeys.hasFocusedPanel) }
+            )
+        )
+
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserBack",
+                title: constant("Back"),
+                subtitle: browserPanelSubtitle,
+                shortcutHint: "⌘[",
+                keywords: ["browser", "back", "history"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserForward",
+                title: constant("Forward"),
+                subtitle: browserPanelSubtitle,
+                shortcutHint: "⌘]",
+                keywords: ["browser", "forward", "history"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserReload",
+                title: constant("Reload Page"),
+                subtitle: browserPanelSubtitle,
+                shortcutHint: "⌘R",
+                keywords: ["browser", "reload", "refresh"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserOpenDefault",
+                title: constant("Open Current Page in Default Browser"),
+                subtitle: browserPanelSubtitle,
+                keywords: ["open", "default", "external", "browser"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserFocusAddressBar",
+                title: constant("Focus Address Bar"),
+                subtitle: browserPanelSubtitle,
+                shortcutHint: "⌘L",
+                keywords: ["browser", "address", "omnibar", "url"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserToggleDevTools",
+                title: constant("Toggle Developer Tools"),
+                subtitle: browserPanelSubtitle,
+                keywords: ["browser", "devtools", "inspector"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserConsole",
+                title: constant("Show JavaScript Console"),
+                subtitle: browserPanelSubtitle,
+                keywords: ["browser", "console", "javascript"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserZoomIn",
+                title: constant("Zoom In"),
+                subtitle: browserPanelSubtitle,
+                keywords: ["browser", "zoom", "in"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserZoomOut",
+                title: constant("Zoom Out"),
+                subtitle: browserPanelSubtitle,
+                keywords: ["browser", "zoom", "out"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserZoomReset",
+                title: constant("Actual Size"),
+                subtitle: browserPanelSubtitle,
+                keywords: ["browser", "zoom", "reset", "actual size"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserClearHistory",
+                title: constant("Clear Browser History"),
+                subtitle: constant("Browser"),
+                keywords: ["browser", "history", "clear"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserSplitRight",
+                title: constant("Split Browser Right"),
+                subtitle: constant("Browser Layout"),
+                keywords: ["browser", "split", "right"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserSplitDown",
+                title: constant("Split Browser Down"),
+                subtitle: constant("Browser Layout"),
+                keywords: ["browser", "split", "down"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.browserDuplicateRight",
+                title: constant("Duplicate Browser to the Right"),
+                subtitle: constant("Browser Layout"),
+                keywords: ["browser", "duplicate", "clone", "split"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsBrowser) }
+            )
+        )
+
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.terminalOpenDirectory",
+                title: constant("Open Current Directory in IDE"),
+                subtitle: terminalPanelSubtitle,
+                keywords: ["terminal", "directory", "open", "ide", "code", "default app"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.terminalFind",
+                title: constant("Find…"),
+                subtitle: terminalPanelSubtitle,
+                shortcutHint: "⌘F",
+                keywords: ["terminal", "find", "search"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.terminalFindNext",
+                title: constant("Find Next"),
+                subtitle: terminalPanelSubtitle,
+                shortcutHint: "⌘G",
+                keywords: ["terminal", "find", "next", "search"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.terminalFindPrevious",
+                title: constant("Find Previous"),
+                subtitle: terminalPanelSubtitle,
+                shortcutHint: "⌘⇧G",
+                keywords: ["terminal", "find", "previous", "search"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.terminalHideFind",
+                title: constant("Hide Find Bar"),
+                subtitle: terminalPanelSubtitle,
+                shortcutHint: "⌘⇧F",
+                keywords: ["terminal", "hide", "find", "search"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.terminalUseSelectionForFind",
+                title: constant("Use Selection for Find"),
+                subtitle: terminalPanelSubtitle,
+                keywords: ["terminal", "selection", "find"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.terminalSplitRight",
+                title: constant("Split Right"),
+                subtitle: constant("Terminal Layout"),
+                keywords: ["terminal", "split", "right"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.terminalSplitDown",
+                title: constant("Split Down"),
+                subtitle: constant("Terminal Layout"),
+                keywords: ["terminal", "split", "down"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.terminalSplitBrowserRight",
+                title: constant("Split Browser Right"),
+                subtitle: constant("Terminal Layout"),
+                keywords: ["terminal", "split", "browser", "right"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.terminalSplitBrowserDown",
+                title: constant("Split Browser Down"),
+                subtitle: constant("Terminal Layout"),
+                keywords: ["terminal", "split", "browser", "down"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+
+        return contributions
+    }
+
+    private func registerCommandPaletteHandlers(_ registry: inout CommandPaletteHandlerRegistry) {
+        registry.register(commandId: "palette.newWorkspace") {
+            tabManager.addWorkspace()
+        }
+        registry.register(commandId: "palette.newWindow") {
+            AppDelegate.shared?.openNewMainWindow(nil)
+        }
+        registry.register(commandId: "palette.newTerminalTab") {
+            tabManager.newSurface()
+        }
+        registry.register(commandId: "palette.newBrowserTab") {
+            _ = tabManager.openBrowser()
+        }
+        registry.register(commandId: "palette.closeTab") {
+            tabManager.closeCurrentPanelWithConfirmation()
+        }
+        registry.register(commandId: "palette.closeWorkspace") {
+            tabManager.closeCurrentWorkspaceWithConfirmation()
+        }
+        registry.register(commandId: "palette.closeWindow") {
+            guard let window = observedWindow ?? NSApp.keyWindow ?? NSApp.mainWindow else {
+                NSSound.beep()
+                return
+            }
+            window.performClose(nil)
+        }
+        registry.register(commandId: "palette.reopenClosedBrowserTab") {
+            _ = tabManager.reopenMostRecentlyClosedBrowserPanel()
+        }
+        registry.register(commandId: "palette.toggleSidebar") {
+            sidebarState.toggle()
+        }
+        registry.register(commandId: "palette.showNotifications") {
+            AppDelegate.shared?.toggleNotificationsPopover(animated: false)
+        }
+        registry.register(commandId: "palette.jumpUnread") {
+            AppDelegate.shared?.jumpToLatestUnread()
+        }
+        registry.register(commandId: "palette.openSettings") {
+            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        }
+        registry.register(commandId: "palette.checkForUpdates") {
+            AppDelegate.shared?.checkForUpdates(nil)
+        }
+        registry.register(commandId: "palette.applyUpdateIfAvailable") {
+            AppDelegate.shared?.applyUpdateIfAvailable(nil)
+        }
+        registry.register(commandId: "palette.attemptUpdate") {
+            AppDelegate.shared?.attemptUpdate(nil)
+        }
+
+        registry.register(commandId: "palette.renameWorkspace") {
+            beginRenameWorkspaceFlow()
+        }
+        registry.register(commandId: "palette.clearWorkspaceName") {
+            guard let workspace = tabManager.selectedWorkspace else {
+                NSSound.beep()
+                return
+            }
+            tabManager.clearCustomTitle(tabId: workspace.id)
+        }
+        registry.register(commandId: "palette.toggleWorkspacePin") {
+            guard let workspace = tabManager.selectedWorkspace else {
+                NSSound.beep()
+                return
+            }
+            tabManager.setPinned(workspace, pinned: !workspace.isPinned)
+        }
+        registry.register(commandId: "palette.nextWorkspace") {
+            tabManager.selectNextTab()
+        }
+        registry.register(commandId: "palette.previousWorkspace") {
+            tabManager.selectPreviousTab()
+        }
+
+        registry.register(commandId: "palette.renameTab") {
+            beginRenameTabFlow()
+        }
+        registry.register(commandId: "palette.clearTabName") {
+            guard let panelContext = focusedPanelContext else {
+                NSSound.beep()
+                return
+            }
+            panelContext.workspace.setPanelCustomTitle(panelId: panelContext.panelId, title: nil)
+        }
+        registry.register(commandId: "palette.toggleTabPin") {
+            guard let panelContext = focusedPanelContext else {
+                NSSound.beep()
+                return
+            }
+            panelContext.workspace.setPanelPinned(
+                panelId: panelContext.panelId,
+                pinned: !panelContext.workspace.isPanelPinned(panelContext.panelId)
+            )
+        }
+        registry.register(commandId: "palette.toggleTabUnread") {
+            guard let panelContext = focusedPanelContext else {
+                NSSound.beep()
+                return
+            }
+            let hasUnread = panelContext.workspace.manualUnreadPanelIds.contains(panelContext.panelId)
+                || notificationStore.hasUnreadNotification(forTabId: panelContext.workspace.id, surfaceId: panelContext.panelId)
+            if hasUnread {
+                panelContext.workspace.markPanelRead(panelContext.panelId)
+            } else {
+                panelContext.workspace.markPanelUnread(panelContext.panelId)
+            }
+        }
+        registry.register(commandId: "palette.nextTabInPane") {
+            tabManager.selectNextSurface()
+        }
+        registry.register(commandId: "palette.previousTabInPane") {
+            tabManager.selectPreviousSurface()
+        }
+
+        registry.register(commandId: "palette.browserBack") {
+            tabManager.focusedBrowserPanel?.goBack()
+        }
+        registry.register(commandId: "palette.browserForward") {
+            tabManager.focusedBrowserPanel?.goForward()
+        }
+        registry.register(commandId: "palette.browserReload") {
+            tabManager.focusedBrowserPanel?.reload()
+        }
+        registry.register(commandId: "palette.browserOpenDefault") {
+            if !openFocusedBrowserInDefaultBrowser() {
+                NSSound.beep()
+            }
+        }
+        registry.register(commandId: "palette.browserFocusAddressBar") {
+            if !focusFocusedBrowserAddressBar() {
+                NSSound.beep()
+            }
+        }
+        registry.register(commandId: "palette.browserToggleDevTools") {
+            if !tabManager.toggleDeveloperToolsFocusedBrowser() {
+                NSSound.beep()
+            }
+        }
+        registry.register(commandId: "palette.browserConsole") {
+            if !tabManager.showJavaScriptConsoleFocusedBrowser() {
+                NSSound.beep()
+            }
+        }
+        registry.register(commandId: "palette.browserZoomIn") {
+            if !tabManager.zoomInFocusedBrowser() {
+                NSSound.beep()
+            }
+        }
+        registry.register(commandId: "palette.browserZoomOut") {
+            if !tabManager.zoomOutFocusedBrowser() {
+                NSSound.beep()
+            }
+        }
+        registry.register(commandId: "palette.browserZoomReset") {
+            if !tabManager.resetZoomFocusedBrowser() {
+                NSSound.beep()
+            }
+        }
+        registry.register(commandId: "palette.browserClearHistory") {
+            BrowserHistoryStore.shared.clearHistory()
+        }
+        registry.register(commandId: "palette.browserSplitRight") {
+            _ = tabManager.createBrowserSplit(direction: .right)
+        }
+        registry.register(commandId: "palette.browserSplitDown") {
+            _ = tabManager.createBrowserSplit(direction: .down)
+        }
+        registry.register(commandId: "palette.browserDuplicateRight") {
+            let url = tabManager.focusedBrowserPanel?.preferredURLStringForOmnibar().flatMap(URL.init(string:))
+            _ = tabManager.createBrowserSplit(direction: .right, url: url)
+        }
+
+        registry.register(commandId: "palette.terminalOpenDirectory") {
+            if !openFocusedDirectoryInDefaultApp() {
+                NSSound.beep()
+            }
+        }
+        registry.register(commandId: "palette.terminalFind") {
+            tabManager.startSearch()
+        }
+        registry.register(commandId: "palette.terminalFindNext") {
+            tabManager.findNext()
+        }
+        registry.register(commandId: "palette.terminalFindPrevious") {
+            tabManager.findPrevious()
+        }
+        registry.register(commandId: "palette.terminalHideFind") {
+            tabManager.hideFind()
+        }
+        registry.register(commandId: "palette.terminalUseSelectionForFind") {
+            tabManager.searchSelection()
+        }
+        registry.register(commandId: "palette.terminalSplitRight") {
+            tabManager.createSplit(direction: .right)
+        }
+        registry.register(commandId: "palette.terminalSplitDown") {
+            tabManager.createSplit(direction: .down)
+        }
+        registry.register(commandId: "palette.terminalSplitBrowserRight") {
+            _ = tabManager.createBrowserSplit(direction: .right)
+        }
+        registry.register(commandId: "palette.terminalSplitBrowserDown") {
+            _ = tabManager.createBrowserSplit(direction: .down)
+        }
+    }
+
+    private var focusedPanelContext: (workspace: Workspace, panelId: UUID, panel: any Panel)? {
+        guard let workspace = tabManager.selectedWorkspace,
+              let panelId = workspace.focusedPanelId,
+              let panel = workspace.panels[panelId] else {
+            return nil
+        }
+        return (workspace, panelId, panel)
+    }
+
+    private func workspaceDisplayName(_ workspace: Workspace) -> String {
+        let custom = workspace.customTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !custom.isEmpty {
+            return custom
+        }
+        let title = workspace.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? "Workspace" : title
+    }
+
+    private func panelDisplayName(workspace: Workspace, panelId: UUID, fallback: String) -> String {
+        let title = workspace.panelTitle(panelId: panelId)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !title.isEmpty {
+            return title
+        }
+        let trimmedFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedFallback.isEmpty ? "Tab" : trimmedFallback
+    }
+
+    private func commandPaletteSelectedIndex(resultCount: Int) -> Int {
+        guard resultCount > 0 else { return 0 }
+        return min(max(commandPaletteSelectedResultIndex, 0), resultCount - 1)
+    }
+
+    static func commandPaletteScrollAnchor(
+        selectedIndex: Int,
+        previousIndex: Int,
+        resultCount: Int,
+        selectedFrame: CGRect?,
+        viewportHeight: CGFloat,
+        contentHeight: CGFloat,
+        epsilon: CGFloat = 0.5
+    ) -> CommandPaletteScrollAnchor? {
+        guard resultCount > 0 else { return nil }
+        guard contentHeight > viewportHeight else { return nil }
+
+        // Always pin edges exactly into view when selection reaches first/last.
+        if selectedIndex <= 0 {
+            return .top
+        }
+        if selectedIndex >= resultCount - 1 {
+            return .bottom
+        }
+
+        if let frame = selectedFrame,
+           frame.minY >= (0 - epsilon),
+           frame.maxY <= (viewportHeight + epsilon) {
+            return nil
+        }
+
+        return selectedIndex >= previousIndex ? .bottom : .top
+    }
+
+    static func commandPaletteEdgeVisibilityCorrectionAnchor(
+        selectedIndex: Int,
+        resultCount: Int,
+        selectedFrame: CGRect?,
+        viewportHeight: CGFloat,
+        contentHeight: CGFloat,
+        epsilon: CGFloat = 0.5
+    ) -> CommandPaletteScrollAnchor? {
+        guard resultCount > 0 else { return nil }
+        guard contentHeight > viewportHeight else { return nil }
+
+        let isTop = selectedIndex <= 0
+        let isBottom = selectedIndex >= (resultCount - 1)
+        guard isTop || isBottom else { return nil }
+
+        guard let frame = selectedFrame else {
+            return isTop ? .top : .bottom
+        }
+
+        if isTop {
+            let topDelta = abs(frame.minY)
+            return topDelta > epsilon ? .top : nil
+        }
+
+        let bottomDelta = abs(frame.maxY - viewportHeight)
+        return bottomDelta > epsilon ? .bottom : nil
+    }
+
+    private func moveCommandPaletteSelection(by delta: Int) {
+        let count = commandPaletteResults.count
+        guard count > 0 else {
+            NSSound.beep()
+            return
+        }
+        let current = commandPaletteSelectedIndex(resultCount: count)
+        commandPaletteSelectedResultIndex = min(max(current + delta, 0), count - 1)
+        syncCommandPaletteDebugStateForObservedWindow()
+    }
+
+    private func handleCommandPaletteControlNavigationKey(
+        modifiers: EventModifiers,
+        delta: Int
+    ) -> BackportKeyPressResult {
+        guard modifiers.contains(.control),
+              !modifiers.contains(.command),
+              !modifiers.contains(.shift),
+              !modifiers.contains(.option) else {
+            return .ignored
+        }
+        moveCommandPaletteSelection(by: delta)
+        return .handled
+    }
+
+    static func commandPaletteShouldPopRenameInputOnDelete(
+        renameDraft: String,
+        modifiers: EventModifiers
+    ) -> Bool {
+        let blockedModifiers: EventModifiers = [.command, .control, .option, .shift]
+        guard modifiers.intersection(blockedModifiers).isEmpty else { return false }
+        return renameDraft.isEmpty
+    }
+
+    private func handleCommandPaletteRenameDeleteBackward(
+        modifiers: EventModifiers
+    ) -> BackportKeyPressResult {
+        guard case .renameInput = commandPaletteMode else { return .ignored }
+        let blockedModifiers: EventModifiers = [.command, .control, .option, .shift]
+        guard modifiers.intersection(blockedModifiers).isEmpty else { return .ignored }
+
+        if Self.commandPaletteShouldPopRenameInputOnDelete(
+            renameDraft: commandPaletteRenameDraft,
+            modifiers: modifiers
+        ) {
+            commandPaletteMode = .commands
+            resetCommandPaletteSearchFocus()
+            syncCommandPaletteDebugStateForObservedWindow()
+            return .handled
+        }
+
+        if let window = observedWindow ?? NSApp.keyWindow ?? NSApp.mainWindow,
+           let editor = window.firstResponder as? NSTextView,
+           editor.isFieldEditor {
+            editor.deleteBackward(nil)
+            commandPaletteRenameDraft = editor.string
+        } else if !commandPaletteRenameDraft.isEmpty {
+            commandPaletteRenameDraft.removeLast()
+        }
+
+        syncCommandPaletteDebugStateForObservedWindow()
+        return .handled
+    }
+
+    private func runSelectedCommandPaletteResult(visibleResults: [CommandPaletteSearchResult]? = nil) {
+        let visibleResults = visibleResults ?? Array(commandPaletteResults)
+        guard !visibleResults.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        let index = commandPaletteSelectedIndex(resultCount: visibleResults.count)
+        runCommandPaletteCommand(visibleResults[index].command)
+    }
+
+    private func runCommandPaletteCommand(_ command: CommandPaletteCommand) {
+        recordCommandPaletteUsage(command.id)
+        command.action()
+        if command.dismissOnRun {
+            dismissCommandPalette(restoreFocus: false)
+        }
+    }
+
+    private func toggleCommandPalette() {
+        if isCommandPalettePresented {
+            dismissCommandPalette()
+        } else {
+            presentCommandPalette(initialQuery: Self.commandPaletteCommandsPrefix)
+        }
+    }
+
+    private func openCommandPaletteCommands() {
+        toggleCommandPalette(initialQuery: Self.commandPaletteCommandsPrefix)
+    }
+
+    private func openCommandPaletteSwitcher() {
+        toggleCommandPalette(initialQuery: "")
+    }
+
+    private func toggleCommandPalette(initialQuery: String) {
+        if isCommandPalettePresented {
+            dismissCommandPalette()
+        } else {
+            presentCommandPalette(initialQuery: initialQuery)
+        }
+    }
+
+    private func openCommandPaletteRenameTabInput() {
+        if !isCommandPalettePresented {
+            presentCommandPalette(initialQuery: Self.commandPaletteCommandsPrefix)
+        }
+        beginRenameTabFlow()
+    }
+
+    static func shouldHandleCommandPaletteRequest(
+        observedWindow: NSWindow?,
+        requestedWindow: NSWindow?,
+        keyWindow: NSWindow?,
+        mainWindow: NSWindow?
+    ) -> Bool {
+        guard let observedWindow else { return false }
+        if let requestedWindow {
+            return requestedWindow === observedWindow
+        }
+        if let keyWindow {
+            return keyWindow === observedWindow
+        }
+        if let mainWindow {
+            return mainWindow === observedWindow
+        }
+        return false
+    }
+
+    private func syncCommandPaletteDebugStateForObservedWindow() {
+        guard let window = observedWindow ?? NSApp.keyWindow ?? NSApp.mainWindow else { return }
+        AppDelegate.shared?.setCommandPaletteVisible(isCommandPalettePresented, for: window)
+        let visibleResultCount = commandPaletteResults.count
+        let selectedIndex = isCommandPalettePresented ? commandPaletteSelectedIndex(resultCount: visibleResultCount) : 0
+        AppDelegate.shared?.setCommandPaletteSelectionIndex(selectedIndex, for: window)
+        AppDelegate.shared?.setCommandPaletteSnapshot(commandPaletteDebugSnapshot(), for: window)
+    }
+
+    private func commandPaletteDebugSnapshot() -> CommandPaletteDebugSnapshot {
+        guard isCommandPalettePresented else { return .empty }
+
+        let mode: String
+        switch commandPaletteMode {
+        case .commands:
+            mode = commandPaletteListScope.rawValue
+        case .renameInput:
+            mode = "rename_input"
+        case .renameConfirm:
+            mode = "rename_confirm"
+        }
+
+        let rows = Array(commandPaletteResults.prefix(20)).map { result in
+            CommandPaletteDebugResultRow(
+                commandId: result.command.id,
+                title: result.command.title,
+                shortcutHint: result.command.shortcutHint,
+                trailingLabel: commandPaletteTrailingLabel(for: result.command)?.text,
+                score: result.score
+            )
+        }
+
+        return CommandPaletteDebugSnapshot(
+            query: commandPaletteQueryForMatching,
+            mode: mode,
+            results: rows
+        )
+    }
+
+    private func presentCommandPalette(initialQuery: String) {
+        if let panelContext = focusedPanelContext {
+            commandPaletteRestoreFocusTarget = CommandPaletteRestoreFocusTarget(
+                workspaceId: panelContext.workspace.id,
+                panelId: panelContext.panelId
+            )
+        } else {
+            commandPaletteRestoreFocusTarget = nil
+        }
+        isCommandPalettePresented = true
+        refreshCommandPaletteUsageHistory()
+        resetCommandPaletteListState(initialQuery: initialQuery)
+    }
+
+    private func resetCommandPaletteListState(initialQuery: String) {
+        commandPaletteMode = .commands
+        commandPaletteQuery = initialQuery
+        commandPaletteRenameDraft = ""
+        commandPaletteSelectedResultIndex = 0
+        commandPaletteHoveredResultIndex = nil
+        commandPaletteLastSelectionIndex = 0
+        commandPaletteRowFrames = [:]
+        resetCommandPaletteSearchFocus()
+        syncCommandPaletteDebugStateForObservedWindow()
+    }
+
+    private func dismissCommandPalette(restoreFocus: Bool = true) {
+        let focusTarget = commandPaletteRestoreFocusTarget
+        isCommandPalettePresented = false
+        commandPaletteMode = .commands
+        commandPaletteQuery = ""
+        commandPaletteRenameDraft = ""
+        commandPaletteSelectedResultIndex = 0
+        commandPaletteHoveredResultIndex = nil
+        commandPaletteLastSelectionIndex = 0
+        commandPaletteRowFrames = [:]
+        isCommandPaletteSearchFocused = false
+        isCommandPaletteRenameFocused = false
+        commandPaletteRestoreFocusTarget = nil
+        if let window = observedWindow {
+            _ = window.makeFirstResponder(nil)
+        }
+        syncCommandPaletteDebugStateForObservedWindow()
+
+        guard restoreFocus, let focusTarget else { return }
+        restoreCommandPaletteFocus(target: focusTarget, attemptsRemaining: 6)
+    }
+
+    private func restoreCommandPaletteFocus(
+        target: CommandPaletteRestoreFocusTarget,
+        attemptsRemaining: Int
+    ) {
+        guard !isCommandPalettePresented else { return }
+        guard tabManager.tabs.contains(where: { $0.id == target.workspaceId }) else { return }
+
+        if let window = observedWindow, !window.isKeyWindow {
+            window.makeKeyAndOrderFront(nil)
+        }
+        tabManager.focusTab(target.workspaceId, surfaceId: target.panelId, suppressFlash: true)
+
+        guard attemptsRemaining > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+            guard !isCommandPalettePresented else { return }
+            if let context = focusedPanelContext,
+               context.workspace.id == target.workspaceId,
+               context.panelId == target.panelId {
+                return
+            }
+            restoreCommandPaletteFocus(target: target, attemptsRemaining: attemptsRemaining - 1)
+        }
+    }
+
+    private func resetCommandPaletteSearchFocus() {
+        applyCommandPaletteInputFocusPolicy(.search)
+    }
+
+    private func resetCommandPaletteRenameFocus() {
+        applyCommandPaletteInputFocusPolicy(commandPaletteRenameInputFocusPolicy())
+    }
+
+    private func handleCommandPaletteRenameInputInteraction() {
+        guard isCommandPalettePresented else { return }
+        guard case .renameInput = commandPaletteMode else { return }
+        applyCommandPaletteInputFocusPolicy(commandPaletteRenameInputFocusPolicy())
+    }
+
+    private func commandPaletteRenameInputFocusPolicy() -> CommandPaletteInputFocusPolicy {
+        let selectAllOnFocus = CommandPaletteRenameSelectionSettings.selectAllOnFocusEnabled()
+        let selectionBehavior: CommandPaletteTextSelectionBehavior = selectAllOnFocus
+            ? .selectAll
+            : .caretAtEnd
+        return CommandPaletteInputFocusPolicy(
+            focusTarget: .rename,
+            selectionBehavior: selectionBehavior
+        )
+    }
+
+    private func applyCommandPaletteInputFocusPolicy(_ policy: CommandPaletteInputFocusPolicy) {
+        DispatchQueue.main.async {
+            switch policy.focusTarget {
+            case .search:
+                isCommandPaletteRenameFocused = false
+                isCommandPaletteSearchFocused = true
+            case .rename:
+                isCommandPaletteSearchFocused = false
+                isCommandPaletteRenameFocused = true
+            }
+            applyCommandPaletteTextSelection(policy.selectionBehavior)
+        }
+    }
+
+    private func applyCommandPaletteTextSelection(
+        _ behavior: CommandPaletteTextSelectionBehavior,
+        attemptsRemaining: Int = 20
+    ) {
+        guard isCommandPalettePresented else { return }
+        switch behavior {
+        case .selectAll:
+            guard case .renameInput = commandPaletteMode else { return }
+        case .caretAtEnd:
+            switch commandPaletteMode {
+            case .commands, .renameInput:
+                break
+            case .renameConfirm:
+                return
+            }
+        }
+        guard let window = observedWindow ?? NSApp.keyWindow ?? NSApp.mainWindow else { return }
+
+        if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor {
+            let length = (editor.string as NSString).length
+            switch behavior {
+            case .selectAll:
+                editor.setSelectedRange(NSRange(location: 0, length: length))
+            case .caretAtEnd:
+                editor.setSelectedRange(NSRange(location: length, length: 0))
+            }
+            return
+        }
+
+        guard attemptsRemaining > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+            applyCommandPaletteTextSelection(behavior, attemptsRemaining: attemptsRemaining - 1)
+        }
+    }
+
+    private func refreshCommandPaletteUsageHistory() {
+        commandPaletteUsageHistoryByCommandId = loadCommandPaletteUsageHistory()
+    }
+
+    private func loadCommandPaletteUsageHistory() -> [String: CommandPaletteUsageEntry] {
+        guard let data = UserDefaults.standard.data(forKey: Self.commandPaletteUsageDefaultsKey) else {
+            return [:]
+        }
+        return (try? JSONDecoder().decode([String: CommandPaletteUsageEntry].self, from: data)) ?? [:]
+    }
+
+    private func persistCommandPaletteUsageHistory(_ history: [String: CommandPaletteUsageEntry]) {
+        guard let data = try? JSONEncoder().encode(history) else { return }
+        UserDefaults.standard.set(data, forKey: Self.commandPaletteUsageDefaultsKey)
+    }
+
+    private func recordCommandPaletteUsage(_ commandId: String) {
+        var history = commandPaletteUsageHistoryByCommandId
+        var entry = history[commandId] ?? CommandPaletteUsageEntry(useCount: 0, lastUsedAt: 0)
+        entry.useCount += 1
+        entry.lastUsedAt = Date().timeIntervalSince1970
+        history[commandId] = entry
+        commandPaletteUsageHistoryByCommandId = history
+        persistCommandPaletteUsageHistory(history)
+    }
+
+    private func commandPaletteHistoryBoost(for commandId: String, queryIsEmpty: Bool) -> Int {
+        guard let entry = commandPaletteUsageHistoryByCommandId[commandId] else { return 0 }
+
+        let now = Date().timeIntervalSince1970
+        let ageDays = max(0, now - entry.lastUsedAt) / 86_400
+        let recencyBoost = max(0, 320 - Int(ageDays * 20))
+        let countBoost = min(180, entry.useCount * 12)
+        let totalBoost = recencyBoost + countBoost
+
+        return queryIsEmpty ? totalBoost : max(0, totalBoost / 3)
+    }
+
+    private func beginRenameWorkspaceFlow() {
+        guard let workspace = tabManager.selectedWorkspace else {
+            NSSound.beep()
+            return
+        }
+        let target = CommandPaletteRenameTarget(
+            kind: .workspace(workspaceId: workspace.id),
+            currentName: workspaceDisplayName(workspace)
+        )
+        startRenameFlow(target)
+    }
+
+    private func beginRenameTabFlow() {
+        guard let panelContext = focusedPanelContext else {
+            NSSound.beep()
+            return
+        }
+        let panelName = panelDisplayName(
+            workspace: panelContext.workspace,
+            panelId: panelContext.panelId,
+            fallback: panelContext.panel.displayTitle
+        )
+        let target = CommandPaletteRenameTarget(
+            kind: .tab(workspaceId: panelContext.workspace.id, panelId: panelContext.panelId),
+            currentName: panelName
+        )
+        startRenameFlow(target)
+    }
+
+    private func startRenameFlow(_ target: CommandPaletteRenameTarget) {
+        commandPaletteRenameDraft = target.currentName
+        commandPaletteMode = .renameInput(target)
+        resetCommandPaletteRenameFocus()
+        syncCommandPaletteDebugStateForObservedWindow()
+    }
+
+    private func continueRenameFlow(target: CommandPaletteRenameTarget) {
+        guard case .renameInput(let activeTarget) = commandPaletteMode,
+              activeTarget == target else { return }
+        applyRenameFlow(target: target, proposedName: commandPaletteRenameDraft)
+    }
+
+    private func applyRenameFlow(target: CommandPaletteRenameTarget, proposedName: String) {
+        let trimmedName = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedName: String? = trimmedName.isEmpty ? nil : trimmedName
+
+        switch target.kind {
+        case .workspace(let workspaceId):
+            tabManager.setCustomTitle(tabId: workspaceId, title: normalizedName)
+        case .tab(let workspaceId, let panelId):
+            guard let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }) else {
+                NSSound.beep()
+                return
+            }
+            workspace.setPanelCustomTitle(panelId: panelId, title: normalizedName)
+        }
+
+        dismissCommandPalette()
+    }
+
+    private func focusFocusedBrowserAddressBar() -> Bool {
+        guard let panel = tabManager.focusedBrowserPanel else { return false }
+        _ = panel.requestAddressBarFocus()
+        NotificationCenter.default.post(name: .browserFocusAddressBar, object: panel.id)
+        return true
+    }
+
+    private func openFocusedBrowserInDefaultBrowser() -> Bool {
+        guard let panel = tabManager.focusedBrowserPanel,
+              let rawURL = panel.preferredURLStringForOmnibar(),
+              let url = URL(string: rawURL),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            return false
+        }
+        return NSWorkspace.shared.open(url)
+    }
+
+    private func openFocusedDirectoryInDefaultApp() -> Bool {
+        guard let directoryURL = focusedTerminalDirectoryURL() else { return false }
+        return NSWorkspace.shared.open(directoryURL)
+    }
+
+    private func focusedTerminalDirectoryURL() -> URL? {
+        guard let workspace = tabManager.selectedWorkspace else { return nil }
+        let rawDirectory: String = {
+            if let focusedPanelId = workspace.focusedPanelId,
+               let directory = workspace.panelDirectories[focusedPanelId] {
+                return directory
+            }
+            return workspace.currentDirectory
+        }()
+        let trimmed = rawDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard FileManager.default.fileExists(atPath: trimmed) else { return nil }
+        return URL(fileURLWithPath: trimmed, isDirectory: true)
+    }
+
 #if DEBUG
     private func debugShortWorkspaceId(_ id: UUID?) -> String {
         guard let id else { return "nil" }
@@ -1025,6 +4464,585 @@ struct ContentView: View {
 #endif
 }
 
+struct CommandPaletteSwitcherSearchMetadata {
+    let directories: [String]
+    let branches: [String]
+    let ports: [Int]
+
+    init(
+        directories: [String] = [],
+        branches: [String] = [],
+        ports: [Int] = []
+    ) {
+        self.directories = directories
+        self.branches = branches
+        self.ports = ports
+    }
+}
+
+enum CommandPaletteSwitcherSearchIndexer {
+    enum MetadataDetail {
+        case workspace
+        case surface
+    }
+
+    private static let metadataDelimiters = CharacterSet(charactersIn: "/\\.:_- ")
+
+    static func keywords(
+        baseKeywords: [String],
+        metadata: CommandPaletteSwitcherSearchMetadata,
+        detail: MetadataDetail = .surface
+    ) -> [String] {
+        let metadataKeywords = metadataKeywordsForSearch(metadata, detail: detail)
+        return uniqueNormalizedPreservingOrder(baseKeywords + metadataKeywords)
+    }
+
+    private static func metadataKeywordsForSearch(
+        _ metadata: CommandPaletteSwitcherSearchMetadata,
+        detail: MetadataDetail
+    ) -> [String] {
+        let directoryTokens = metadata.directories.flatMap { directoryTokensForSearch($0, detail: detail) }
+        let branchTokens = metadata.branches.flatMap { branchTokensForSearch($0, detail: detail) }
+        let portTokens = metadata.ports.flatMap(portTokensForSearch)
+
+        var contextKeywords: [String] = []
+        if !directoryTokens.isEmpty {
+            contextKeywords.append(contentsOf: ["directory", "dir", "cwd", "path"])
+        }
+        if !branchTokens.isEmpty {
+            contextKeywords.append(contentsOf: ["branch", "git"])
+        }
+        if !portTokens.isEmpty {
+            contextKeywords.append(contentsOf: ["port", "ports"])
+        }
+
+        return contextKeywords + directoryTokens + branchTokens + portTokens
+    }
+
+    private static func directoryTokensForSearch(
+        _ rawDirectory: String,
+        detail: MetadataDetail
+    ) -> [String] {
+        let trimmed = rawDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let standardized = (trimmed as NSString).standardizingPath
+        let canonical = standardized.isEmpty ? trimmed : standardized
+        let abbreviated = (canonical as NSString).abbreviatingWithTildeInPath
+        switch detail {
+        case .workspace:
+            return uniqueNormalizedPreservingOrder([trimmed, canonical, abbreviated])
+        case .surface:
+            let basename = URL(fileURLWithPath: canonical, isDirectory: true).lastPathComponent
+            let components = canonical.components(separatedBy: metadataDelimiters).filter { !$0.isEmpty }
+            return uniqueNormalizedPreservingOrder(
+                [trimmed, canonical, abbreviated, basename] + components
+            )
+        }
+    }
+
+    private static func branchTokensForSearch(
+        _ rawBranch: String,
+        detail: MetadataDetail
+    ) -> [String] {
+        let trimmed = rawBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        switch detail {
+        case .workspace:
+            return [trimmed]
+        case .surface:
+            let components = trimmed.components(separatedBy: metadataDelimiters).filter { !$0.isEmpty }
+            return uniqueNormalizedPreservingOrder([trimmed] + components)
+        }
+    }
+
+    private static func portTokensForSearch(_ port: Int) -> [String] {
+        guard (1...65535).contains(port) else { return [] }
+        let portText = String(port)
+        return [portText, ":\(portText)"]
+    }
+
+    private static func uniqueNormalizedPreservingOrder(_ values: [String]) -> [String] {
+        var result: [String] = []
+        var seen: Set<String> = []
+        result.reserveCapacity(values.count)
+
+        for value in values {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let normalizedKey = trimmed
+                .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+                .lowercased()
+            guard seen.insert(normalizedKey).inserted else { continue }
+            result.append(trimmed)
+        }
+        return result
+    }
+}
+
+enum CommandPaletteFuzzyMatcher {
+    private static let tokenBoundaryChars: Set<Character> = [" ", "-", "_", "/", ".", ":"]
+
+    static func score(query: String, candidate: String) -> Int? {
+        score(query: query, candidates: [candidate])
+    }
+
+    static func score(query: String, candidates: [String]) -> Int? {
+        let normalizedQuery = normalize(query)
+        guard !normalizedQuery.isEmpty else { return 0 }
+        let tokens = normalizedQuery.split(separator: " ").map(String.init).filter { !$0.isEmpty }
+        guard !tokens.isEmpty else { return 0 }
+
+        let normalizedCandidates = candidates
+            .map(normalize)
+            .filter { !$0.isEmpty }
+        guard !normalizedCandidates.isEmpty else { return nil }
+
+        var totalScore = 0
+        for token in tokens {
+            var bestTokenScore: Int?
+            for candidate in normalizedCandidates {
+                guard let candidateScore = scoreToken(token, in: candidate) else { continue }
+                bestTokenScore = max(bestTokenScore ?? candidateScore, candidateScore)
+            }
+            guard let bestTokenScore else { return nil }
+            totalScore += bestTokenScore
+        }
+        return totalScore
+    }
+
+    static func matchCharacterIndices(query: String, candidate: String) -> Set<Int> {
+        let normalizedQuery = normalize(query)
+        guard !normalizedQuery.isEmpty else { return [] }
+
+        let tokens = normalizedQuery.split(separator: " ").map(String.init).filter { !$0.isEmpty }
+        guard !tokens.isEmpty else { return [] }
+
+        let loweredCandidate = normalize(candidate)
+        guard !loweredCandidate.isEmpty else { return [] }
+
+        let candidateChars = Array(loweredCandidate)
+        var matched: Set<Int> = []
+
+        for token in tokens {
+            if token == loweredCandidate {
+                matched.formUnion(0..<candidateChars.count)
+                continue
+            }
+
+            if loweredCandidate.hasPrefix(token) {
+                matched.formUnion(0..<min(token.count, candidateChars.count))
+                continue
+            }
+
+            if let range = loweredCandidate.range(of: token) {
+                let start = loweredCandidate.distance(from: loweredCandidate.startIndex, to: range.lowerBound)
+                let end = min(candidateChars.count, start + token.count)
+                matched.formUnion(start..<end)
+                continue
+            }
+
+            if let initialism = initialismMatchIndices(token: token, candidate: loweredCandidate) {
+                matched.formUnion(initialism)
+                continue
+            }
+
+            if let stitched = stitchedWordPrefixMatchIndices(token: token, candidate: loweredCandidate) {
+                matched.formUnion(stitched)
+                continue
+            }
+
+            guard token.count <= 3 else { continue }
+            if let subsequence = subsequenceMatchIndices(token: token, candidate: loweredCandidate) {
+                matched.formUnion(subsequence)
+            }
+        }
+
+        return matched
+    }
+
+    private static func normalize(_ text: String) -> String {
+        text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .lowercased()
+    }
+
+    private static func scoreToken(_ token: String, in candidate: String) -> Int? {
+        guard !token.isEmpty else { return 0 }
+
+        let candidateChars = Array(candidate)
+        let tokenChars = Array(token)
+        guard tokenChars.count <= candidateChars.count else { return nil }
+
+        if token == candidate {
+            return 8000
+        }
+        if candidate.hasPrefix(token) {
+            return 6800 - max(0, candidate.count - token.count)
+        }
+
+        var bestScore: Int?
+        if let wordExactScore = bestWordScore(tokenChars: tokenChars, candidateChars: candidateChars, requireExactWord: true) {
+            bestScore = max(bestScore ?? wordExactScore, wordExactScore)
+        }
+        if let wordPrefixScore = bestWordScore(tokenChars: tokenChars, candidateChars: candidateChars, requireExactWord: false) {
+            bestScore = max(bestScore ?? wordPrefixScore, wordPrefixScore)
+        }
+
+        if let range = candidate.range(of: token) {
+            let distance = candidate.distance(from: candidate.startIndex, to: range.lowerBound)
+            let lengthPenalty = max(0, candidate.count - token.count)
+            let boundaryBoost: Int = {
+                guard distance > 0 else { return 220 }
+                let prior = candidateChars[distance - 1]
+                return tokenBoundaryChars.contains(prior) ? 180 : 0
+            }()
+            let containsScore = 4200 + boundaryBoost - (distance * 9) - lengthPenalty
+            bestScore = max(bestScore ?? containsScore, containsScore)
+        }
+
+        if let initialismScore = initialismScore(tokenChars: tokenChars, candidateChars: candidateChars) {
+            bestScore = max(bestScore ?? initialismScore, initialismScore)
+        }
+
+        if let stitchedScore = stitchedWordPrefixScore(tokenChars: tokenChars, candidateChars: candidateChars) {
+            bestScore = max(bestScore ?? stitchedScore, stitchedScore)
+        }
+
+        if tokenChars.count <= 3, let subsequence = subsequenceScore(token: token, candidate: candidate) {
+            bestScore = max(bestScore ?? subsequence, subsequence)
+        }
+
+        guard let bestScore else { return nil }
+        return max(1, bestScore)
+    }
+
+    private static func bestWordScore(
+        tokenChars: [Character],
+        candidateChars: [Character],
+        requireExactWord: Bool
+    ) -> Int? {
+        guard !tokenChars.isEmpty else { return nil }
+
+        var best: Int?
+        for segment in wordSegments(candidateChars) {
+            let wordLength = segment.end - segment.start
+            guard tokenChars.count <= wordLength else { continue }
+
+            var matchesPrefix = true
+            for offset in 0..<tokenChars.count where candidateChars[segment.start + offset] != tokenChars[offset] {
+                matchesPrefix = false
+                break
+            }
+            guard matchesPrefix else { continue }
+            if requireExactWord && tokenChars.count != wordLength { continue }
+
+            let lengthPenalty = max(0, wordLength - tokenChars.count) * 6
+            let distancePenalty = segment.start * 8
+            let trailingPenalty = max(0, candidateChars.count - wordLength)
+            let scoreBase = requireExactWord ? 6200 : 5600
+            let score = scoreBase - distancePenalty - lengthPenalty - trailingPenalty
+            best = max(best ?? score, score)
+        }
+
+        return best
+    }
+
+    private static func initialismScore(tokenChars: [Character], candidateChars: [Character]) -> Int? {
+        guard !tokenChars.isEmpty else { return nil }
+        let segments = wordSegments(candidateChars)
+        guard tokenChars.count <= segments.count else { return nil }
+
+        var matchedStarts: [Int] = []
+        var searchWordIndex = 0
+
+        for tokenChar in tokenChars {
+            var found = false
+            while searchWordIndex < segments.count {
+                let segment = segments[searchWordIndex]
+                searchWordIndex += 1
+                if candidateChars[segment.start] == tokenChar {
+                    matchedStarts.append(segment.start)
+                    found = true
+                    break
+                }
+            }
+            if !found { return nil }
+        }
+
+        let firstStart = matchedStarts.first ?? 0
+        let skippedWords = max(0, segments.count - tokenChars.count)
+        return 3000 + (tokenChars.count * 160) - (firstStart * 5) - (skippedWords * 30)
+    }
+
+    private static func tokenPrefixMatches(
+        tokenChars: [Character],
+        tokenStart: Int,
+        length: Int,
+        candidateChars: [Character],
+        candidateStart: Int
+    ) -> Bool {
+        guard length > 0 else { return false }
+        guard tokenStart + length <= tokenChars.count else { return false }
+        guard candidateStart + length <= candidateChars.count else { return false }
+
+        for offset in 0..<length where tokenChars[tokenStart + offset] != candidateChars[candidateStart + offset] {
+            return false
+        }
+        return true
+    }
+
+    private static func stitchedWordPrefixScore(tokenChars: [Character], candidateChars: [Character]) -> Int? {
+        guard tokenChars.count >= 4 else { return nil }
+        let segments = wordSegments(candidateChars)
+        guard segments.count >= 2 else { return nil }
+
+        struct StitchState: Hashable {
+            let tokenIndex: Int
+            let wordIndex: Int
+            let usedWords: Int
+        }
+
+        var memo: [StitchState: Int?] = [:]
+
+        func dfs(tokenIndex: Int, wordIndex: Int, usedWords: Int) -> Int? {
+            if tokenIndex == tokenChars.count {
+                return usedWords >= 2 ? 0 : nil
+            }
+            guard wordIndex < segments.count else { return nil }
+
+            let state = StitchState(tokenIndex: tokenIndex, wordIndex: wordIndex, usedWords: usedWords)
+            if let cached = memo[state] {
+                return cached
+            }
+
+            var best: Int?
+            let remainingChars = tokenChars.count - tokenIndex
+            for segmentIndex in wordIndex..<segments.count {
+                let segment = segments[segmentIndex]
+                let segmentLength = segment.end - segment.start
+                let maxChunk = min(segmentLength, remainingChars)
+                guard maxChunk > 0 else { continue }
+
+                let skippedWords = max(0, segmentIndex - wordIndex)
+                let skipPenalty = skippedWords * 120
+                for chunkLength in stride(from: maxChunk, through: 1, by: -1) {
+                    guard tokenPrefixMatches(
+                        tokenChars: tokenChars,
+                        tokenStart: tokenIndex,
+                        length: chunkLength,
+                        candidateChars: candidateChars,
+                        candidateStart: segment.start
+                    ) else {
+                        continue
+                    }
+                    guard let suffixScore = dfs(
+                        tokenIndex: tokenIndex + chunkLength,
+                        wordIndex: segmentIndex + 1,
+                        usedWords: min(2, usedWords + 1)
+                    ) else {
+                        continue
+                    }
+
+                    let chunkCoverage = chunkLength * 220
+                    let contiguityBonus = segmentIndex == wordIndex ? 80 : 0
+                    let segmentRemainderPenalty = max(0, segmentLength - chunkLength) * 9
+                    let distancePenalty = segment.start * 4
+                    let chunkScore = chunkCoverage + contiguityBonus - segmentRemainderPenalty - distancePenalty - skipPenalty
+                    let totalScore = suffixScore + chunkScore
+                    best = max(best ?? totalScore, totalScore)
+                }
+            }
+
+            memo[state] = best
+            return best
+        }
+
+        guard let stitchedScore = dfs(tokenIndex: 0, wordIndex: 0, usedWords: 0) else { return nil }
+        let lengthPenalty = max(0, candidateChars.count - tokenChars.count)
+        return 3500 + stitchedScore - lengthPenalty
+    }
+
+    private static func stitchedWordPrefixMatchIndices(token: String, candidate: String) -> Set<Int>? {
+        let tokenChars = Array(token)
+        let candidateChars = Array(candidate)
+        guard tokenChars.count >= 4 else { return nil }
+
+        let segments = wordSegments(candidateChars)
+        guard segments.count >= 2 else { return nil }
+
+        var tokenIndex = 0
+        var nextWordIndex = 0
+        var usedWords = 0
+        var matchedIndices: Set<Int> = []
+
+        while tokenIndex < tokenChars.count {
+            let remainingChars = tokenChars.count - tokenIndex
+            var foundMatch = false
+
+            for segmentIndex in nextWordIndex..<segments.count {
+                let segment = segments[segmentIndex]
+                let segmentLength = segment.end - segment.start
+                let maxChunk = min(segmentLength, remainingChars)
+                guard maxChunk > 0 else { continue }
+
+                for chunkLength in stride(from: maxChunk, through: 1, by: -1) {
+                    guard tokenPrefixMatches(
+                        tokenChars: tokenChars,
+                        tokenStart: tokenIndex,
+                        length: chunkLength,
+                        candidateChars: candidateChars,
+                        candidateStart: segment.start
+                    ) else {
+                        continue
+                    }
+
+                    matchedIndices.formUnion(segment.start..<(segment.start + chunkLength))
+                    tokenIndex += chunkLength
+                    nextWordIndex = segmentIndex + 1
+                    usedWords += 1
+                    foundMatch = true
+                    break
+                }
+
+                if foundMatch { break }
+            }
+
+            if !foundMatch { return nil }
+        }
+
+        guard usedWords >= 2 else { return nil }
+        return matchedIndices
+    }
+
+    private static func wordSegments(_ candidateChars: [Character]) -> [(start: Int, end: Int)] {
+        var segments: [(start: Int, end: Int)] = []
+        var index = 0
+
+        while index < candidateChars.count {
+            while index < candidateChars.count, tokenBoundaryChars.contains(candidateChars[index]) {
+                index += 1
+            }
+            guard index < candidateChars.count else { break }
+            let start = index
+            while index < candidateChars.count, !tokenBoundaryChars.contains(candidateChars[index]) {
+                index += 1
+            }
+            segments.append((start: start, end: index))
+        }
+
+        return segments
+    }
+
+    private static func subsequenceScore(token: String, candidate: String) -> Int? {
+        let tokenChars = Array(token)
+        let candidateChars = Array(candidate)
+        guard tokenChars.count <= candidateChars.count else { return nil }
+
+        var searchIndex = 0
+        var previousMatch = -1
+        var consecutiveRun = 0
+        var score = 0
+
+        for tokenChar in tokenChars {
+            var foundIndex: Int?
+            while searchIndex < candidateChars.count {
+                if candidateChars[searchIndex] == tokenChar {
+                    foundIndex = searchIndex
+                    break
+                }
+                searchIndex += 1
+            }
+            guard let matchedIndex = foundIndex else { return nil }
+
+            score += 90
+            if matchedIndex == 0 || tokenBoundaryChars.contains(candidateChars[matchedIndex - 1]) {
+                score += 140
+            }
+            if matchedIndex == previousMatch + 1 {
+                consecutiveRun += 1
+                score += min(200, consecutiveRun * 45)
+            } else {
+                consecutiveRun = 0
+                score -= min(120, max(0, matchedIndex - previousMatch - 1) * 4)
+            }
+
+            previousMatch = matchedIndex
+            searchIndex = matchedIndex + 1
+        }
+
+        score -= max(0, candidateChars.count - tokenChars.count)
+        return max(1, score)
+    }
+
+    private static func subsequenceMatchIndices(token: String, candidate: String) -> Set<Int>? {
+        let tokenChars = Array(token)
+        let candidateChars = Array(candidate)
+        guard tokenChars.count <= candidateChars.count else { return nil }
+
+        var indices: Set<Int> = []
+        var searchIndex = 0
+
+        for tokenChar in tokenChars {
+            var foundIndex: Int?
+            while searchIndex < candidateChars.count {
+                if candidateChars[searchIndex] == tokenChar {
+                    foundIndex = searchIndex
+                    break
+                }
+                searchIndex += 1
+            }
+            guard let matchIndex = foundIndex else { return nil }
+            indices.insert(matchIndex)
+            searchIndex = matchIndex + 1
+        }
+
+        return indices
+    }
+
+    private static func initialismMatchIndices(token: String, candidate: String) -> Set<Int>? {
+        let tokenChars = Array(token)
+        let candidateChars = Array(candidate)
+        guard !tokenChars.isEmpty else { return nil }
+
+        let segments = wordSegments(candidateChars)
+        guard tokenChars.count <= segments.count else { return nil }
+
+        var matched: Set<Int> = []
+        var searchWordIndex = 0
+
+        for tokenChar in tokenChars {
+            var found = false
+            while searchWordIndex < segments.count {
+                let segment = segments[searchWordIndex]
+                searchWordIndex += 1
+                if candidateChars[segment.start] == tokenChar {
+                    matched.insert(segment.start)
+                    found = true
+                    break
+                }
+            }
+            if !found { return nil }
+        }
+
+        return matched
+    }
+}
+
+private struct SidebarResizerAccessibilityModifier: ViewModifier {
+    let accessibilityIdentifier: String?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let accessibilityIdentifier {
+            content.accessibilityIdentifier(accessibilityIdentifier)
+        } else {
+            content
+        }
+    }
+}
+
 struct VerticalTabsSidebar: View {
     @ObservedObject var updateViewModel: UpdateViewModel
     @EnvironmentObject var tabManager: TabManager
@@ -1033,6 +5051,7 @@ struct VerticalTabsSidebar: View {
     @Binding var lastSidebarSelectionIndex: Int?
     @StateObject private var commandKeyMonitor = SidebarCommandKeyMonitor()
     @StateObject private var dragAutoScrollController = SidebarDragAutoScrollController()
+    @StateObject private var dragFailsafeMonitor = SidebarDragFailsafeMonitor()
     @State private var draggedTabId: UUID?
     @State private var dropIndicator: SidebarDropIndicator?
 
@@ -1100,38 +5119,75 @@ struct VerticalTabsSidebar: View {
                 .modifier(ClearScrollBackground())
             }
 #if DEBUG
-            if CmuxFeatureFlags.sparkleEnabled {
-                SidebarDevFooter(updateViewModel: updateViewModel)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            SidebarDevFooter(updateViewModel: updateViewModel)
+                .frame(maxWidth: .infinity, alignment: .leading)
 #else
-            if CmuxFeatureFlags.sparkleEnabled {
-                UpdatePill(model: updateViewModel)
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            UpdatePill(model: updateViewModel)
+                .padding(.horizontal, 10)
+                .padding(.bottom, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
 #endif
         }
         .accessibilityIdentifier("Sidebar")
         .ignoresSafeArea()
         .background(SidebarBackdrop().ignoresSafeArea())
+        .background(
+            WindowAccessor { window in
+                commandKeyMonitor.setHostWindow(window)
+            }
+            .frame(width: 0, height: 0)
+        )
         .onAppear {
             commandKeyMonitor.start()
             draggedTabId = nil
             dropIndicator = nil
+            SidebarDragLifecycleNotification.postStateDidChange(
+                tabId: nil,
+                reason: "sidebar_appear"
+            )
         }
         .onDisappear {
             commandKeyMonitor.stop()
             dragAutoScrollController.stop()
+            dragFailsafeMonitor.stop()
             draggedTabId = nil
             dropIndicator = nil
+            SidebarDragLifecycleNotification.postStateDidChange(
+                tabId: nil,
+                reason: "sidebar_disappear"
+            )
         }
         .onChange(of: draggedTabId) { newDraggedTabId in
-            guard newDraggedTabId == nil else { return }
+            SidebarDragLifecycleNotification.postStateDidChange(
+                tabId: newDraggedTabId,
+                reason: "drag_state_change"
+            )
+#if DEBUG
+            dlog("sidebar.dragState.sidebar tab=\(debugShortSidebarTabId(newDraggedTabId))")
+#endif
+            if newDraggedTabId != nil {
+                dragFailsafeMonitor.start {
+                    SidebarDragLifecycleNotification.postClearRequest(reason: $0)
+                }
+                return
+            }
+            dragFailsafeMonitor.stop()
             dragAutoScrollController.stop()
             dropIndicator = nil
         }
+        .onReceive(NotificationCenter.default.publisher(for: SidebarDragLifecycleNotification.requestClear)) { notification in
+            guard draggedTabId != nil else { return }
+            let reason = SidebarDragLifecycleNotification.reason(from: notification)
+#if DEBUG
+            dlog("sidebar.dragClear tab=\(debugShortSidebarTabId(draggedTabId)) reason=\(reason)")
+#endif
+            draggedTabId = nil
+        }
+    }
+
+    private func debugShortSidebarTabId(_ id: UUID?) -> String {
+        guard let id else { return "nil" }
+        return String(id.uuidString.prefix(5))
     }
 }
 
@@ -1140,6 +5196,35 @@ enum SidebarCommandHintPolicy {
 
     static func shouldShowHints(for modifierFlags: NSEvent.ModifierFlags) -> Bool {
         modifierFlags.intersection(.deviceIndependentFlagsMask) == [.command]
+    }
+
+    static func isCurrentWindow(
+        hostWindowNumber: Int?,
+        hostWindowIsKey: Bool,
+        eventWindowNumber: Int?,
+        keyWindowNumber: Int?
+    ) -> Bool {
+        guard let hostWindowNumber, hostWindowIsKey else { return false }
+        if let eventWindowNumber {
+            return eventWindowNumber == hostWindowNumber
+        }
+        return keyWindowNumber == hostWindowNumber
+    }
+
+    static func shouldShowHints(
+        for modifierFlags: NSEvent.ModifierFlags,
+        hostWindowNumber: Int?,
+        hostWindowIsKey: Bool,
+        eventWindowNumber: Int?,
+        keyWindowNumber: Int?
+    ) -> Bool {
+        shouldShowHints(for: modifierFlags) &&
+            isCurrentWindow(
+                hostWindowNumber: hostWindowNumber,
+                hostWindowIsKey: hostWindowIsKey,
+                eventWindowNumber: eventWindowNumber,
+                keyWindowNumber: keyWindowNumber
+            )
     }
 }
 
@@ -1167,32 +5252,281 @@ enum ShortcutHintDebugSettings {
     }
 }
 
+enum SidebarDragLifecycleNotification {
+    static let stateDidChange = Notification.Name("cmux.sidebarDragStateDidChange")
+    static let requestClear = Notification.Name("cmux.sidebarDragRequestClear")
+    static let tabIdKey = "tabId"
+    static let reasonKey = "reason"
+
+    static func postStateDidChange(tabId: UUID?, reason: String) {
+        var userInfo: [AnyHashable: Any] = [reasonKey: reason]
+        if let tabId {
+            userInfo[tabIdKey] = tabId
+        }
+        NotificationCenter.default.post(
+            name: stateDidChange,
+            object: nil,
+            userInfo: userInfo
+        )
+    }
+
+    static func postClearRequest(reason: String) {
+        NotificationCenter.default.post(
+            name: requestClear,
+            object: nil,
+            userInfo: [reasonKey: reason]
+        )
+    }
+
+    static func tabId(from notification: Notification) -> UUID? {
+        notification.userInfo?[tabIdKey] as? UUID
+    }
+
+    static func reason(from notification: Notification) -> String {
+        notification.userInfo?[reasonKey] as? String ?? "unknown"
+    }
+}
+
+enum SidebarOutsideDropResetPolicy {
+    static func shouldResetDrag(draggedTabId: UUID?, hasSidebarDragPayload: Bool) -> Bool {
+        draggedTabId != nil && hasSidebarDragPayload
+    }
+}
+
+enum SidebarDragFailsafePolicy {
+    static let pollInterval: TimeInterval = 0.05
+    static let clearDelay: TimeInterval = 0.15
+
+    static func shouldRequestClear(isDragActive: Bool, isLeftMouseButtonDown: Bool) -> Bool {
+        isDragActive && !isLeftMouseButtonDown
+    }
+}
+
+@MainActor
+private final class SidebarDragFailsafeMonitor: ObservableObject {
+    private static let escapeKeyCode: UInt16 = 53
+    private var timer: Timer?
+    private var pendingClearWorkItem: DispatchWorkItem?
+    private var appResignObserver: NSObjectProtocol?
+    private var keyDownMonitor: Any?
+    private var onRequestClear: ((String) -> Void)?
+
+    func start(onRequestClear: @escaping (String) -> Void) {
+        self.onRequestClear = onRequestClear
+        if timer == nil {
+            let timer = Timer(timeInterval: SidebarDragFailsafePolicy.pollInterval, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.tick()
+                }
+            }
+            self.timer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+        if appResignObserver == nil {
+            appResignObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.requestClearSoon(reason: "app_resign_active")
+                }
+            }
+        }
+        if keyDownMonitor == nil {
+            keyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                if event.keyCode == Self.escapeKeyCode {
+                    self?.requestClearSoon(reason: "escape_cancel")
+                }
+                return event
+            }
+        }
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        pendingClearWorkItem?.cancel()
+        pendingClearWorkItem = nil
+        if let appResignObserver {
+            NotificationCenter.default.removeObserver(appResignObserver)
+            self.appResignObserver = nil
+        }
+        if let keyDownMonitor {
+            NSEvent.removeMonitor(keyDownMonitor)
+            self.keyDownMonitor = nil
+        }
+        onRequestClear = nil
+    }
+
+    private func tick() {
+        let isLeftMouseButtonDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
+        guard SidebarDragFailsafePolicy.shouldRequestClear(
+            isDragActive: true, // Monitor only runs while drag is active.
+            isLeftMouseButtonDown: isLeftMouseButtonDown
+        ) else { return }
+        requestClearSoon(reason: "mouse_up_failsafe")
+    }
+
+    private func requestClearSoon(reason: String) {
+        guard pendingClearWorkItem == nil else { return }
+#if DEBUG
+        dlog("sidebar.dragFailsafe.schedule reason=\(reason)")
+#endif
+        let workItem = DispatchWorkItem { [weak self] in
+#if DEBUG
+            dlog("sidebar.dragFailsafe.fire reason=\(reason)")
+#endif
+            self?.pendingClearWorkItem = nil
+            self?.onRequestClear?(reason)
+        }
+        pendingClearWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + SidebarDragFailsafePolicy.clearDelay, execute: workItem)
+    }
+}
+
+private struct SidebarExternalDropOverlay: View {
+    let draggedTabId: UUID?
+
+    var body: some View {
+        let dragPasteboardTypes = NSPasteboard(name: .drag).types
+        let shouldCapture = DragOverlayRoutingPolicy.shouldCaptureSidebarExternalOverlay(
+            draggedTabId: draggedTabId,
+            pasteboardTypes: dragPasteboardTypes
+        )
+        Group {
+            if shouldCapture {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .allowsHitTesting(true)
+                    .onDrop(
+                        of: [SidebarTabDragPayload.typeIdentifier],
+                        delegate: SidebarExternalDropDelegate(draggedTabId: draggedTabId)
+                    )
+            } else {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+}
+
+private struct SidebarExternalDropDelegate: DropDelegate {
+    let draggedTabId: UUID?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        let hasSidebarPayload = info.hasItemsConforming(to: [SidebarTabDragPayload.typeIdentifier])
+        let shouldReset = SidebarOutsideDropResetPolicy.shouldResetDrag(
+            draggedTabId: draggedTabId,
+            hasSidebarDragPayload: hasSidebarPayload
+        )
+#if DEBUG
+        dlog(
+            "sidebar.dropOutside.validate tab=\(debugShortSidebarTabId(draggedTabId)) " +
+            "hasType=\(hasSidebarPayload) allowed=\(shouldReset)"
+        )
+#endif
+        return shouldReset
+    }
+
+    func dropEntered(info: DropInfo) {
+#if DEBUG
+        dlog("sidebar.dropOutside.entered tab=\(debugShortSidebarTabId(draggedTabId))")
+#endif
+    }
+
+    func dropExited(info: DropInfo) {
+#if DEBUG
+        dlog("sidebar.dropOutside.exited tab=\(debugShortSidebarTabId(draggedTabId))")
+#endif
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard validateDrop(info: info) else { return nil }
+#if DEBUG
+        dlog("sidebar.dropOutside.updated tab=\(debugShortSidebarTabId(draggedTabId)) op=move")
+#endif
+        // Explicit move proposal avoids AppKit showing a copy (+) cursor.
+        return DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard validateDrop(info: info) else { return false }
+#if DEBUG
+        dlog("sidebar.dropOutside.perform tab=\(debugShortSidebarTabId(draggedTabId))")
+#endif
+        SidebarDragLifecycleNotification.postClearRequest(reason: "outside_sidebar_drop")
+        return true
+    }
+
+    private func debugShortSidebarTabId(_ id: UUID?) -> String {
+        guard let id else { return "nil" }
+        return String(id.uuidString.prefix(5))
+    }
+}
+
 @MainActor
 private final class SidebarCommandKeyMonitor: ObservableObject {
     @Published private(set) var isCommandPressed = false
 
+    private weak var hostWindow: NSWindow?
+    private var hostWindowDidBecomeKeyObserver: NSObjectProtocol?
+    private var hostWindowDidResignKeyObserver: NSObjectProtocol?
     private var flagsMonitor: Any?
     private var keyDownMonitor: Any?
-    private var resignObserver: NSObjectProtocol?
+    private var appResignObserver: NSObjectProtocol?
     private var pendingShowWorkItem: DispatchWorkItem?
+
+    func setHostWindow(_ window: NSWindow?) {
+        guard hostWindow !== window else { return }
+        removeHostWindowObservers()
+        hostWindow = window
+        guard let window else {
+            cancelPendingHintShow(resetVisible: true)
+            return
+        }
+
+        hostWindowDidBecomeKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.update(from: NSEvent.modifierFlags, eventWindow: nil)
+            }
+        }
+
+        hostWindowDidResignKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.cancelPendingHintShow(resetVisible: true)
+            }
+        }
+
+        update(from: NSEvent.modifierFlags, eventWindow: nil)
+    }
 
     func start() {
         guard flagsMonitor == nil else {
-            update(from: NSEvent.modifierFlags)
+            update(from: NSEvent.modifierFlags, eventWindow: nil)
             return
         }
 
         flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            self?.update(from: event.modifierFlags)
+            self?.update(from: event.modifierFlags, eventWindow: event.window)
             return event
         }
 
         keyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.cancelPendingHintShow(resetVisible: true)
+            self?.handleKeyDown(event)
             return event
         }
 
-        resignObserver = NotificationCenter.default.addObserver(
+        appResignObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification,
             object: nil,
             queue: .main
@@ -1202,7 +5536,7 @@ private final class SidebarCommandKeyMonitor: ObservableObject {
             }
         }
 
-        update(from: NSEvent.modifierFlags)
+        update(from: NSEvent.modifierFlags, eventWindow: nil)
     }
 
     func stop() {
@@ -1214,15 +5548,36 @@ private final class SidebarCommandKeyMonitor: ObservableObject {
             NSEvent.removeMonitor(keyDownMonitor)
             self.keyDownMonitor = nil
         }
-        if let resignObserver {
-            NotificationCenter.default.removeObserver(resignObserver)
-            self.resignObserver = nil
+        if let appResignObserver {
+            NotificationCenter.default.removeObserver(appResignObserver)
+            self.appResignObserver = nil
         }
+        removeHostWindowObservers()
         cancelPendingHintShow(resetVisible: true)
     }
 
-    private func update(from modifierFlags: NSEvent.ModifierFlags) {
-        guard SidebarCommandHintPolicy.shouldShowHints(for: modifierFlags) else {
+    private func handleKeyDown(_ event: NSEvent) {
+        guard isCurrentWindow(eventWindow: event.window) else { return }
+        cancelPendingHintShow(resetVisible: true)
+    }
+
+    private func isCurrentWindow(eventWindow: NSWindow?) -> Bool {
+        SidebarCommandHintPolicy.isCurrentWindow(
+            hostWindowNumber: hostWindow?.windowNumber,
+            hostWindowIsKey: hostWindow?.isKeyWindow ?? false,
+            eventWindowNumber: eventWindow?.windowNumber,
+            keyWindowNumber: NSApp.keyWindow?.windowNumber
+        )
+    }
+
+    private func update(from modifierFlags: NSEvent.ModifierFlags, eventWindow: NSWindow?) {
+        guard SidebarCommandHintPolicy.shouldShowHints(
+            for: modifierFlags,
+            hostWindowNumber: hostWindow?.windowNumber,
+            hostWindowIsKey: hostWindow?.isKeyWindow ?? false,
+            eventWindowNumber: eventWindow?.windowNumber,
+            keyWindowNumber: NSApp.keyWindow?.windowNumber
+        ) else {
             cancelPendingHintShow(resetVisible: true)
             return
         }
@@ -1237,7 +5592,13 @@ private final class SidebarCommandKeyMonitor: ObservableObject {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingShowWorkItem = nil
-            guard SidebarCommandHintPolicy.shouldShowHints(for: NSEvent.modifierFlags) else { return }
+            guard SidebarCommandHintPolicy.shouldShowHints(
+                for: NSEvent.modifierFlags,
+                hostWindowNumber: self.hostWindow?.windowNumber,
+                hostWindowIsKey: self.hostWindow?.isKeyWindow ?? false,
+                eventWindowNumber: nil,
+                keyWindowNumber: NSApp.keyWindow?.windowNumber
+            ) else { return }
             self.isCommandPressed = true
         }
 
@@ -1250,6 +5611,17 @@ private final class SidebarCommandKeyMonitor: ObservableObject {
         pendingShowWorkItem = nil
         if resetVisible {
             isCommandPressed = false
+        }
+    }
+
+    private func removeHostWindowObservers() {
+        if let hostWindowDidBecomeKeyObserver {
+            NotificationCenter.default.removeObserver(hostWindowDidBecomeKeyObserver)
+            self.hostWindowDidBecomeKeyObserver = nil
+        }
+        if let hostWindowDidResignKeyObserver {
+            NotificationCenter.default.removeObserver(hostWindowDidResignKeyObserver)
+            self.hostWindowDidResignKeyObserver = nil
         }
     }
 }
@@ -1303,14 +5675,6 @@ private struct SidebarTopBlurEffect: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
-}
-
-private struct SidebarFramePreferenceKey: PreferenceKey {
-    static var defaultValue: CGRect = .zero
-
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
-        value = nextValue()
-    }
 }
 
 private struct SidebarScrollViewResolver: NSViewRepresentable {
@@ -1402,39 +5766,10 @@ private struct SidebarEmptyArea: View {
     }
 }
 
-private enum SidebarColorPalette {
-    static var accentIsLight: Bool {
-        NSColor(Color.accentColor).isLightColor
-    }
-
-    static var activePrimary: Color {
-        accentIsLight ? Color.black.opacity(0.92) : Color.white.opacity(0.95)
-    }
-
-    static var activeSecondary: Color {
-        accentIsLight ? Color.black.opacity(0.75) : Color.white.opacity(0.8)
-    }
-
-    static var activeMuted: Color {
-        accentIsLight ? Color.black.opacity(0.62) : Color.white.opacity(0.65)
-    }
-
-    static var activeBadgeBackground: Color {
-        accentIsLight ? Color.black.opacity(0.18) : Color.white.opacity(0.25)
-    }
-
-    static var activeProgressTrack: Color {
-        accentIsLight ? Color.black.opacity(0.12) : Color.white.opacity(0.15)
-    }
-
-    static var activeProgressFill: Color {
-        accentIsLight ? Color.black.opacity(0.65) : Color.white.opacity(0.8)
-    }
-}
-
 private struct TabItemView: View {
     @EnvironmentObject var tabManager: TabManager
     @EnvironmentObject var notificationStore: TerminalNotificationStore
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var tab: Tab
     let index: Int
     let rowSpacing: CGFloat
@@ -1451,11 +5786,14 @@ private struct TabItemView: View {
     @AppStorage(ShortcutHintDebugSettings.sidebarHintYKey) private var sidebarShortcutHintYOffset = ShortcutHintDebugSettings.defaultSidebarHintY
     @AppStorage(ShortcutHintDebugSettings.alwaysShowHintsKey) private var alwaysShowShortcutHints = ShortcutHintDebugSettings.defaultAlwaysShowHints
     @AppStorage("sidebarShowGitBranch") private var sidebarShowGitBranch = true
+    @AppStorage(SidebarBranchLayoutSettings.key) private var sidebarBranchVerticalLayout = SidebarBranchLayoutSettings.defaultVerticalLayout
     @AppStorage("sidebarShowGitBranchIcon") private var sidebarShowGitBranchIcon = false
     @AppStorage("sidebarShowPorts") private var sidebarShowPorts = true
     @AppStorage("sidebarShowLog") private var sidebarShowLog = true
     @AppStorage("sidebarShowProgress") private var sidebarShowProgress = true
     @AppStorage("sidebarShowStatusPills") private var sidebarShowStatusPills = true
+    @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
+    private var activeTabIndicatorStyleRaw = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
 
     var isActive: Bool {
         tabManager.selectedTabId == tab.id
@@ -1467,6 +5805,65 @@ private struct TabItemView: View {
 
     private var isBeingDragged: Bool {
         draggedTabId == tab.id
+    }
+
+    private var activeTabIndicatorStyle: SidebarActiveTabIndicatorStyle {
+        SidebarActiveTabIndicatorSettings.resolvedStyle(rawValue: activeTabIndicatorStyleRaw)
+    }
+
+    private var titleFontWeight: Font.Weight {
+        .semibold
+    }
+
+    private var showsLeadingRail: Bool {
+        explicitRailColor != nil
+    }
+
+    private var activeBorderLineWidth: CGFloat {
+        switch activeTabIndicatorStyle {
+        case .leftRail:
+            return 0
+        case .solidFill:
+            return isActive ? 1.5 : 0
+        }
+    }
+
+    private var activeBorderColor: Color {
+        guard isActive else { return .clear }
+        switch activeTabIndicatorStyle {
+        case .leftRail:
+            return .clear
+        case .solidFill:
+            return Color.primary.opacity(0.5)
+        }
+    }
+
+    private var usesInvertedActiveForeground: Bool {
+        isActive
+    }
+
+    private var activePrimaryTextColor: Color {
+        usesInvertedActiveForeground ? .white : .primary
+    }
+
+    private func activeSecondaryColor(_ opacity: Double = 0.75) -> Color {
+        usesInvertedActiveForeground ? .white.opacity(opacity) : .secondary
+    }
+
+    private var activeUnreadBadgeFillColor: Color {
+        usesInvertedActiveForeground ? Color.white.opacity(0.25) : Color.accentColor
+    }
+
+    private var activeProgressTrackColor: Color {
+        usesInvertedActiveForeground ? Color.white.opacity(0.15) : Color.secondary.opacity(0.2)
+    }
+
+    private var activeProgressFillColor: Color {
+        usesInvertedActiveForeground ? Color.white.opacity(0.8) : Color.accentColor
+    }
+
+    private var shortcutHintEmphasis: Double {
+        usesInvertedActiveForeground ? 1.0 : 0.9
     }
 
     private var workspaceShortcutDigit: Int? {
@@ -1505,7 +5902,7 @@ private struct TabItemView: View {
                 if unreadCount > 0 {
                     ZStack {
                         Circle()
-                            .fill(isActive ? SidebarColorPalette.activeBadgeBackground : Color.accentColor)
+                            .fill(activeUnreadBadgeFillColor)
                         Text("\(unreadCount)")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundColor(.white)
@@ -1516,12 +5913,12 @@ private struct TabItemView: View {
                 if tab.isPinned {
                     Image(systemName: "pin.fill")
                         .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
+                        .foregroundColor(activeSecondaryColor(0.8))
                 }
 
                 Text(tab.title)
-                    .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundColor(isActive ? SidebarColorPalette.activePrimary : .primary)
+                    .font(.system(size: 12.5, weight: titleFontWeight))
+                    .foregroundColor(activePrimaryTextColor)
                     .lineLimit(1)
                     .truncationMode(.tail)
 
@@ -1536,10 +5933,10 @@ private struct TabItemView: View {
                     }) {
                         Image(systemName: "xmark")
                             .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
+                            .foregroundColor(activeSecondaryColor(0.7))
                     }
                     .buttonStyle(.plain)
-                    .help("Close Workspace (\(StoredShortcut(key: "w", command: true, shift: true, option: false, control: false).displayString))")
+                    .help(KeyboardShortcutSettings.Action.closeWorkspace.tooltip("Close Workspace"))
                     .frame(width: 16, height: 16, alignment: .center)
                     .opacity(showCloseButton && !showsWorkspaceShortcutHint ? 1 : 0)
                     .allowsHitTesting(showCloseButton && !showsWorkspaceShortcutHint)
@@ -1550,10 +5947,10 @@ private struct TabItemView: View {
                             .fixedSize(horizontal: true, vertical: false)
                             .font(.system(size: 10, weight: .semibold, design: .rounded))
                             .monospacedDigit()
-                            .foregroundColor(isActive ? SidebarColorPalette.activePrimary : .primary)
+                            .foregroundColor(activePrimaryTextColor)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .background(ShortcutHintPillBackground(emphasis: isActive ? 1.0 : 0.9))
+                            .background(ShortcutHintPillBackground(emphasis: shortcutHintEmphasis))
                             .offset(
                                 x: ShortcutHintDebugSettings.clamped(sidebarShortcutHintXOffset),
                                 y: ShortcutHintDebugSettings.clamped(sidebarShortcutHintYOffset)
@@ -1568,7 +5965,7 @@ private struct TabItemView: View {
             if let subtitle = latestNotificationText {
                 Text(subtitle)
                     .font(.system(size: 10))
-                    .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
+                    .foregroundColor(activeSecondaryColor(0.8))
                     .lineLimit(2)
                     .truncationMode(.tail)
                     .multilineTextAlignment(.leading)
@@ -1580,7 +5977,7 @@ private struct TabItemView: View {
                         if lhs.timestamp != rhs.timestamp { return lhs.timestamp > rhs.timestamp }
                         return lhs.key < rhs.key
                     }),
-                    isActive: isActive,
+                    isActive: usesInvertedActiveForeground,
                     onFocus: { updateSelection() }
                 )
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -1591,10 +5988,10 @@ private struct TabItemView: View {
                 HStack(spacing: 4) {
                     Image(systemName: logLevelIcon(latestLog.level))
                         .font(.system(size: 8))
-                        .foregroundColor(logLevelColor(latestLog.level, isActive: isActive))
+                        .foregroundColor(logLevelColor(latestLog.level, isActive: usesInvertedActiveForeground))
                     Text(latestLog.message)
                         .font(.system(size: 10))
-                        .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
+                        .foregroundColor(activeSecondaryColor(0.8))
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -1607,9 +6004,9 @@ private struct TabItemView: View {
                     GeometryReader { geo in
                         ZStack(alignment: .leading) {
                             Capsule()
-                                .fill(isActive ? SidebarColorPalette.activeProgressTrack : Color.secondary.opacity(0.2))
+                                .fill(activeProgressTrackColor)
                             Capsule()
-                                .fill(isActive ? SidebarColorPalette.activeProgressFill : Color.accentColor)
+                                .fill(activeProgressFillColor)
                                 .frame(width: max(0, geo.size.width * CGFloat(progress.value)))
                         }
                     }
@@ -1618,27 +6015,72 @@ private struct TabItemView: View {
                     if let label = progress.label {
                         Text(label)
                             .font(.system(size: 9))
-                            .foregroundColor(isActive ? SidebarColorPalette.activeMuted : .secondary)
+                            .foregroundColor(activeSecondaryColor(0.6))
                             .lineLimit(1)
                     }
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
-            // Branch + directory + ports row
-            if let dirRow = branchDirectoryRow {
+            // Branch + directory row
+            if sidebarBranchVerticalLayout {
+                if !verticalBranchDirectoryLines.isEmpty {
+                    HStack(alignment: .top, spacing: 3) {
+                        if sidebarShowGitBranchIcon, sidebarShowGitBranch, verticalRowsContainBranch {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.system(size: 9))
+                                .foregroundColor(activeSecondaryColor(0.6))
+                        }
+                        VStack(alignment: .leading, spacing: 1) {
+                            ForEach(Array(verticalBranchDirectoryLines.enumerated()), id: \.offset) { _, line in
+                                HStack(spacing: 3) {
+                                    if let branch = line.branch {
+                                        Text(branch)
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundColor(activeSecondaryColor(0.75))
+                                            .lineLimit(1)
+                                            .truncationMode(.tail)
+                                    }
+                                    if line.branch != nil, line.directory != nil {
+                                        Image(systemName: "circle.fill")
+                                            .font(.system(size: 3))
+                                            .foregroundColor(activeSecondaryColor(0.6))
+                                            .padding(.horizontal, 1)
+                                    }
+                                    if let directory = line.directory {
+                                        Text(directory)
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundColor(activeSecondaryColor(0.75))
+                                            .lineLimit(1)
+                                            .truncationMode(.tail)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let dirRow = branchDirectoryRow {
                 HStack(spacing: 3) {
-                    if sidebarShowGitBranch && tab.gitBranch != nil && sidebarShowGitBranchIcon {
+                    if sidebarShowGitBranch && gitBranchSummaryText != nil && sidebarShowGitBranchIcon {
                         Image(systemName: "arrow.triangle.branch")
                             .font(.system(size: 9))
-                            .foregroundColor(isActive ? SidebarColorPalette.activeMuted : .secondary)
+                            .foregroundColor(activeSecondaryColor(0.6))
                     }
                     Text(dirRow)
                         .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
+                        .foregroundColor(activeSecondaryColor(0.75))
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
+            }
+
+            // Ports row
+            if sidebarShowPorts, !tab.listeningPorts.isEmpty {
+                Text(tab.listeningPorts.map { ":\($0)" }.joined(separator: ", "))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(activeSecondaryColor(0.75))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
         }
         .animation(.easeInOut(duration: 0.2), value: tab.logEntries.count)
@@ -1648,6 +6090,20 @@ private struct TabItemView: View {
         .background(
             RoundedRectangle(cornerRadius: 6)
                 .fill(backgroundColor)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(activeBorderColor, lineWidth: activeBorderLineWidth)
+                }
+                .overlay(alignment: .leading) {
+                    if showsLeadingRail {
+                        Capsule(style: .continuous)
+                            .fill(railColor)
+                            .frame(width: 3)
+                            .padding(.leading, 4)
+                            .padding(.vertical, 5)
+                            .offset(x: -1)
+                    }
+                }
         )
         .padding(.horizontal, 6)
         .background {
@@ -1715,10 +6171,16 @@ private struct TabItemView: View {
         }
         .contextMenu {
             let targetIds = contextTargetIds()
+            let tabColorPalette = WorkspaceTabColorSettings.palette()
             let shouldPin = !tab.isPinned
             let pinLabel = targetIds.count > 1
-                ? (shouldPin ? "Pin Tabs" : "Unpin Tabs")
-                : (shouldPin ? "Pin Tab" : "Unpin Tab")
+                ? (shouldPin ? "Pin Workspaces" : "Unpin Workspaces")
+                : (shouldPin ? "Pin Workspace" : "Unpin Workspace")
+            let closeLabel = targetIds.count > 1 ? "Close Workspaces" : "Close Workspace"
+            let markReadLabel = targetIds.count > 1 ? "Mark Workspaces as Read" : "Mark Workspace as Read"
+            let markUnreadLabel = targetIds.count > 1 ? "Mark Workspaces as Unread" : "Mark Workspace as Unread"
+            let renameWorkspaceShortcut = KeyboardShortcutSettings.shortcut(for: .renameWorkspace)
+            let closeWorkspaceShortcut = KeyboardShortcutSettings.shortcut(for: .closeWorkspace)
             Button(pinLabel) {
                 for id in targetIds {
                     if let tab = tabManager.tabs.first(where: { $0.id == id }) {
@@ -1728,13 +6190,52 @@ private struct TabItemView: View {
                 syncSelectionAfterMutation()
             }
 
-            Button("Rename Tab…") {
-                promptRename()
+            if let key = renameWorkspaceShortcut.keyEquivalent {
+                Button("Rename Workspace…") {
+                    promptRename()
+                }
+                .keyboardShortcut(key, modifiers: renameWorkspaceShortcut.eventModifiers)
+            } else {
+                Button("Rename Workspace…") {
+                    promptRename()
+                }
             }
 
             if tab.hasCustomTitle {
-                Button("Remove Custom Name") {
+                Button("Remove Custom Workspace Name") {
                     tabManager.clearCustomTitle(tabId: tab.id)
+                }
+            }
+
+            Menu("Tab Color") {
+                if tab.customColor != nil {
+                    Button {
+                        applyTabColor(nil, targetIds: targetIds)
+                    } label: {
+                        Label("Clear Color", systemImage: "xmark.circle")
+                    }
+                }
+
+                Button {
+                    promptCustomColor(targetIds: targetIds)
+                } label: {
+                    Label("Choose Custom Color…", systemImage: "paintpalette")
+                }
+
+                if !tabColorPalette.isEmpty {
+                    Divider()
+                }
+
+                ForEach(tabColorPalette, id: \.id) { entry in
+                    Button {
+                        applyTabColor(entry.hex, targetIds: targetIds)
+                    } label: {
+                        Label {
+                            Text(entry.name)
+                        } icon: {
+                            Image(nsImage: coloredCircleImage(color: tabColorSwatchColor(for: entry.hex)))
+                        }
+                    }
                 }
             }
 
@@ -1750,30 +6251,6 @@ private struct TabItemView: View {
             }
             .disabled(index >= tabManager.tabs.count - 1)
 
-            Divider()
-
-            Button("Close Tabs") {
-                closeTabs(targetIds, allowPinned: true)
-            }
-            .disabled(targetIds.isEmpty)
-
-            Button("Close Others") {
-                closeOtherTabs(targetIds)
-            }
-            .disabled(tabManager.tabs.count <= 1 || targetIds.count == tabManager.tabs.count)
-
-            Button("Close Tabs Below") {
-                closeTabsBelow(tabId: tab.id)
-            }
-            .disabled(index >= tabManager.tabs.count - 1)
-
-            Button("Close Tabs Above") {
-                closeTabsAbove(tabId: tab.id)
-            }
-            .disabled(index == 0)
-
-            Divider()
-
             Button("Move to Top") {
                 tabManager.moveTabsToTop(Set(targetIds))
                 syncSelectionAfterMutation()
@@ -1782,12 +6259,42 @@ private struct TabItemView: View {
 
             Divider()
 
-            Button("Mark as Read") {
+            if let key = closeWorkspaceShortcut.keyEquivalent {
+                Button(closeLabel) {
+                    closeTabs(targetIds, allowPinned: true)
+                }
+                .keyboardShortcut(key, modifiers: closeWorkspaceShortcut.eventModifiers)
+                .disabled(targetIds.isEmpty)
+            } else {
+                Button(closeLabel) {
+                    closeTabs(targetIds, allowPinned: true)
+                }
+                .disabled(targetIds.isEmpty)
+            }
+
+            Button("Close Other Workspaces") {
+                closeOtherTabs(targetIds)
+            }
+            .disabled(tabManager.tabs.count <= 1 || targetIds.count == tabManager.tabs.count)
+
+            Button("Close Workspaces Below") {
+                closeTabsBelow(tabId: tab.id)
+            }
+            .disabled(index >= tabManager.tabs.count - 1)
+
+            Button("Close Workspaces Above") {
+                closeTabsAbove(tabId: tab.id)
+            }
+            .disabled(index == 0)
+
+            Divider()
+
+            Button(markReadLabel) {
                 markTabsRead(targetIds)
             }
             .disabled(!hasUnreadNotifications(in: targetIds))
 
-            Button("Mark as Unread") {
+            Button(markUnreadLabel) {
                 markTabsUnread(targetIds)
             }
             .disabled(!hasReadNotifications(in: targetIds))
@@ -1795,13 +6302,50 @@ private struct TabItemView: View {
     }
 
     private var backgroundColor: Color {
-        if isActive {
-            return Color.accentColor
+        switch activeTabIndicatorStyle {
+        case .leftRail:
+            if isActive        { return Color.accentColor }
+            if isMultiSelected { return Color.accentColor.opacity(0.25) }
+            return Color.clear
+        case .solidFill:
+            if let custom = resolvedCustomTabColor {
+                if isActive        { return custom }
+                if isMultiSelected { return custom.opacity(0.35) }
+                return custom.opacity(0.7)
+            }
+            if isActive        { return Color.accentColor }
+            if isMultiSelected { return Color.accentColor.opacity(0.25) }
+            return Color.clear
         }
-        if isMultiSelected {
-            return Color.accentColor.opacity(0.25)
+    }
+
+    private var railColor: Color {
+        explicitRailColor ?? .clear
+    }
+
+    private var explicitRailColor: Color? {
+        guard activeTabIndicatorStyle == .leftRail,
+              let custom = resolvedCustomTabColor else {
+            return nil
         }
-        return Color.clear
+        return custom.opacity(0.95)
+    }
+
+    private var resolvedCustomTabColor: Color? {
+        guard let hex = tab.customColor else { return nil }
+        return WorkspaceTabColorSettings.displayColor(
+            hex: hex,
+            colorScheme: colorScheme,
+            forceBright: activeTabIndicatorStyle == .leftRail
+        )
+    }
+
+    private func tabColorSwatchColor(for hex: String) -> NSColor {
+        WorkspaceTabColorSettings.displayNSColor(
+            hex: hex,
+            colorScheme: colorScheme,
+            forceBright: activeTabIndicatorStyle == .leftRail
+        ) ?? NSColor(hex: hex) ?? .gray
     }
 
     private var showsCenteredTopDropIndicator: Bool {
@@ -1952,9 +6496,8 @@ private struct TabItemView: View {
         var parts: [String] = []
 
         // Git branch (if enabled and available)
-        if sidebarShowGitBranch, let git = tab.gitBranch {
-            let dirty = git.isDirty ? "*" : ""
-            parts.append("\(git.branch)\(dirty)")
+        if sidebarShowGitBranch, let gitSummary = gitBranchSummaryText {
+            parts.append(gitSummary)
         }
 
         // Directory summary
@@ -1962,14 +6505,60 @@ private struct TabItemView: View {
             parts.append(dirs)
         }
 
-        // Ports (if enabled and available)
-        if sidebarShowPorts, !tab.listeningPorts.isEmpty {
-            let portsStr = tab.listeningPorts.map { ":\($0)" }.joined(separator: ",")
-            parts.append(portsStr)
-        }
-
         let result = parts.joined(separator: " · ")
         return result.isEmpty ? nil : result
+    }
+
+    private var gitBranchSummaryText: String? {
+        let lines = gitBranchSummaryLines
+        guard !lines.isEmpty else { return nil }
+        return lines.joined(separator: " | ")
+    }
+
+    private var gitBranchSummaryLines: [String] {
+        tab.sidebarGitBranchesInDisplayOrder().map { branch in
+            "\(branch.branch)\(branch.isDirty ? "*" : "")"
+        }
+    }
+
+    private var verticalBranchDirectoryEntries: [SidebarBranchOrdering.BranchDirectoryEntry] {
+        tab.sidebarBranchDirectoryEntriesInDisplayOrder()
+    }
+
+    private var verticalRowsContainBranch: Bool {
+        sidebarShowGitBranch && verticalBranchDirectoryLines.contains { $0.branch != nil }
+    }
+
+    private struct VerticalBranchDirectoryLine {
+        let branch: String?
+        let directory: String?
+    }
+
+    private var verticalBranchDirectoryLines: [VerticalBranchDirectoryLine] {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return verticalBranchDirectoryEntries.compactMap { entry in
+            let branchText: String? = {
+                guard sidebarShowGitBranch, let branch = entry.branch else { return nil }
+                return "\(branch)\(entry.isDirty ? "*" : "")"
+            }()
+
+            let directoryText: String? = {
+                guard let directory = entry.directory else { return nil }
+                let shortened = shortenPath(directory, home: home)
+                return shortened.isEmpty ? nil : shortened
+            }()
+
+            switch (branchText, directoryText) {
+            case let (branch?, directory?):
+                return VerticalBranchDirectoryLine(branch: branch, directory: directory)
+            case let (branch?, nil):
+                return VerticalBranchDirectoryLine(branch: branch, directory: nil)
+            case let (nil, directory?):
+                return VerticalBranchDirectoryLine(branch: nil, directory: directory)
+            default:
+                return nil
+            }
+        }
     }
 
     private var directorySummaryText: String? {
@@ -1977,7 +6566,7 @@ private struct TabItemView: View {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         var seen: Set<String> = []
         var entries: [String] = []
-        for panelId in tab.panels.keys {
+        for panelId in tab.sidebarOrderedPanelIds() {
             let directory = tab.panelDirectories[panelId] ?? tab.currentDirectory
             let shortened = shortenPath(directory, home: home)
             guard !shortened.isEmpty else { continue }
@@ -2001,11 +6590,11 @@ private struct TabItemView: View {
     private func logLevelColor(_ level: SidebarLogLevel, isActive: Bool) -> Color {
         if isActive {
             switch level {
-            case .info: return SidebarColorPalette.activeMuted
-            case .progress: return SidebarColorPalette.activeSecondary
-            case .success: return SidebarColorPalette.activePrimary
-            case .warning: return SidebarColorPalette.activePrimary
-            case .error: return SidebarColorPalette.activePrimary
+            case .info: return .white.opacity(0.5)
+            case .progress: return .white.opacity(0.8)
+            case .success: return .white.opacity(0.9)
+            case .warning: return .white.opacity(0.9)
+            case .error: return .white.opacity(0.9)
             }
         }
         switch level {
@@ -2029,12 +6618,61 @@ private struct TabItemView: View {
         return trimmed
     }
 
+    private func applyTabColor(_ hex: String?, targetIds: [UUID]) {
+        for targetId in targetIds {
+            tabManager.setTabColor(tabId: targetId, color: hex)
+        }
+    }
+
+    private func promptCustomColor(targetIds: [UUID]) {
+        let alert = NSAlert()
+        alert.messageText = "Custom Tab Color"
+        alert.informativeText = "Enter a hex color in the format #RRGGBB."
+
+        let seed = tab.customColor ?? WorkspaceTabColorSettings.customColors().first ?? ""
+        let input = NSTextField(string: seed)
+        input.placeholderString = "#1565C0"
+        input.frame = NSRect(x: 0, y: 0, width: 240, height: 22)
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Apply")
+        alert.addButton(withTitle: "Cancel")
+
+        let alertWindow = alert.window
+        alertWindow.initialFirstResponder = input
+        DispatchQueue.main.async {
+            alertWindow.makeFirstResponder(input)
+            input.selectText(nil)
+        }
+
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else { return }
+        guard let normalized = WorkspaceTabColorSettings.addCustomColor(input.stringValue) else {
+            showInvalidColorAlert(input.stringValue)
+            return
+        }
+        applyTabColor(normalized, targetIds: targetIds)
+    }
+
+    private func showInvalidColorAlert(_ value: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Invalid Color"
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            alert.informativeText = "Enter a hex color in the format #RRGGBB."
+        } else {
+            alert.informativeText = "\"\(trimmed)\" is not a valid hex color. Use #RRGGBB."
+        }
+        alert.addButton(withTitle: "OK")
+        _ = alert.runModal()
+    }
+
     private func promptRename() {
         let alert = NSAlert()
-        alert.messageText = "Rename Tab"
-        alert.informativeText = "Enter a custom name for this tab."
+        alert.messageText = "Rename Workspace"
+        alert.informativeText = "Enter a custom name for this workspace."
         let input = NSTextField(string: tab.customTitle ?? tab.title)
-        input.placeholderString = "Tab name"
+        input.placeholderString = "Workspace name"
         input.frame = NSRect(x: 0, y: 0, width: 240, height: 22)
         alert.accessoryView = input
         alert.addButton(withTitle: "Rename")
@@ -2062,7 +6700,7 @@ private struct SidebarStatusPillsRow: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(statusText)
                 .font(.system(size: 10))
-                .foregroundColor(isActive ? SidebarColorPalette.activeSecondary : .secondary)
+                .foregroundColor(isActive ? .white.opacity(0.8) : .secondary)
                 .lineLimit(isExpanded ? nil : 3)
                 .truncationMode(.tail)
                 .multilineTextAlignment(.leading)
@@ -2085,7 +6723,7 @@ private struct SidebarStatusPillsRow: View {
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(isActive ? SidebarColorPalette.activeMuted : .secondary.opacity(0.9))
+                .foregroundColor(isActive ? .white.opacity(0.65) : .secondary.opacity(0.9))
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -2419,6 +7057,9 @@ private struct SidebarTabDropDelegate: DropDelegate {
     }
 
     func dropExited(info: DropInfo) {
+#if DEBUG
+        dlog("sidebar.dropExited target=\(targetTabId?.uuidString.prefix(5) ?? "end")")
+#endif
         if dropIndicator?.tabId == targetTabId {
             dropIndicator = nil
         }
@@ -2427,6 +7068,12 @@ private struct SidebarTabDropDelegate: DropDelegate {
     func dropUpdated(info: DropInfo) -> DropProposal? {
         dragAutoScrollController.updateFromDragLocation()
         updateDropIndicator(for: info)
+#if DEBUG
+        dlog(
+            "sidebar.dropUpdated target=\(targetTabId?.uuidString.prefix(5) ?? "end") " +
+            "indicator=\(debugIndicator(dropIndicator))"
+        )
+#endif
         return DropProposal(operation: .move)
     }
 
@@ -2439,8 +7086,18 @@ private struct SidebarTabDropDelegate: DropDelegate {
         #if DEBUG
         dlog("sidebar.drop target=\(targetTabId?.uuidString.prefix(5) ?? "end")")
         #endif
-        guard let draggedTabId else { return false }
-        guard let fromIndex = tabManager.tabs.firstIndex(where: { $0.id == draggedTabId }) else { return false }
+        guard let draggedTabId else {
+#if DEBUG
+            dlog("sidebar.drop.abort reason=missingDraggedTab")
+#endif
+            return false
+        }
+        guard let fromIndex = tabManager.tabs.firstIndex(where: { $0.id == draggedTabId }) else {
+#if DEBUG
+            dlog("sidebar.drop.abort reason=draggedTabMissing tab=\(draggedTabId.uuidString.prefix(5))")
+#endif
+            return false
+        }
         let tabIds = tabManager.tabs.map(\.id)
         guard let targetIndex = SidebarDropPlanner.targetIndex(
             draggedTabId: draggedTabId,
@@ -2448,14 +7105,26 @@ private struct SidebarTabDropDelegate: DropDelegate {
             indicator: dropIndicator,
             tabIds: tabIds
         ) else {
+#if DEBUG
+            dlog(
+                "sidebar.drop.abort reason=noTargetIndex tab=\(draggedTabId.uuidString.prefix(5)) " +
+                "target=\(targetTabId?.uuidString.prefix(5) ?? "end") indicator=\(debugIndicator(dropIndicator))"
+            )
+#endif
             return false
         }
 
         guard fromIndex != targetIndex else {
+#if DEBUG
+            dlog("sidebar.drop.noop from=\(fromIndex) to=\(targetIndex)")
+#endif
             syncSidebarSelection()
             return true
         }
 
+#if DEBUG
+        dlog("sidebar.drop.commit tab=\(draggedTabId.uuidString.prefix(5)) from=\(fromIndex) to=\(targetIndex)")
+#endif
         _ = tabManager.reorderWorkspace(tabId: draggedTabId, toIndex: targetIndex)
         if let selectedId = tabManager.selectedTabId {
             selectedTabIds = [selectedId]
@@ -2485,6 +7154,12 @@ private struct SidebarTabDropDelegate: DropDelegate {
         } else {
             lastSidebarSelectionIndex = nil
         }
+    }
+
+    private func debugIndicator(_ indicator: SidebarDropIndicator?) -> String {
+        guard let indicator else { return "nil" }
+        let tabText = indicator.tabId.map { String($0.uuidString.prefix(5)) } ?? "end"
+        return "\(tabText):\(indicator.edge == .top ? "top" : "bottom")"
     }
 }
 

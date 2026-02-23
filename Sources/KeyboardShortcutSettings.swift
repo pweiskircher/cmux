@@ -8,6 +8,7 @@ enum KeyboardShortcutSettings {
         case toggleSidebar
         case newTab
         case newWindow
+        case closeWindow
         case showNotifications
         case jumpToUnread
         case triggerFlash
@@ -17,6 +18,9 @@ enum KeyboardShortcutSettings {
         case prevSurface
         case nextSidebarTab
         case prevSidebarTab
+        case renameTab
+        case renameWorkspace
+        case closeWorkspace
         case newSurface
 
         // Panes / splits
@@ -26,17 +30,22 @@ enum KeyboardShortcutSettings {
         case focusDown
         case splitRight
         case splitDown
+        case splitBrowserRight
+        case splitBrowserDown
 
         // Panels
         case openBrowser
+        case toggleBrowserDeveloperTools
+        case showBrowserJavaScriptConsole
 
         var id: String { rawValue }
 
         var label: String {
             switch self {
             case .toggleSidebar: return "Toggle Sidebar"
-            case .newTab: return "New Tab"
+            case .newTab: return "New Workspace"
             case .newWindow: return "New Window"
+            case .closeWindow: return "Close Window"
             case .showNotifications: return "Show Notifications"
             case .jumpToUnread: return "Jump to Latest Unread"
             case .triggerFlash: return "Flash Focused Panel"
@@ -44,6 +53,9 @@ enum KeyboardShortcutSettings {
             case .prevSurface: return "Previous Surface"
             case .nextSidebarTab: return "Next Workspace"
             case .prevSidebarTab: return "Previous Workspace"
+            case .renameTab: return "Rename Tab"
+            case .renameWorkspace: return "Rename Workspace"
+            case .closeWorkspace: return "Close Workspace"
             case .newSurface: return "New Surface"
             case .focusLeft: return "Focus Pane Left"
             case .focusRight: return "Focus Pane Right"
@@ -51,7 +63,11 @@ enum KeyboardShortcutSettings {
             case .focusDown: return "Focus Pane Down"
             case .splitRight: return "Split Right"
             case .splitDown: return "Split Down"
+            case .splitBrowserRight: return "Split Browser Right"
+            case .splitBrowserDown: return "Split Browser Down"
             case .openBrowser: return "Open Browser"
+            case .toggleBrowserDeveloperTools: return "Toggle Browser Developer Tools"
+            case .showBrowserJavaScriptConsole: return "Show Browser JavaScript Console"
             }
         }
 
@@ -60,21 +76,29 @@ enum KeyboardShortcutSettings {
             case .toggleSidebar: return "shortcut.toggleSidebar"
             case .newTab: return "shortcut.newTab"
             case .newWindow: return "shortcut.newWindow"
+            case .closeWindow: return "shortcut.closeWindow"
             case .showNotifications: return "shortcut.showNotifications"
             case .jumpToUnread: return "shortcut.jumpToUnread"
             case .triggerFlash: return "shortcut.triggerFlash"
             case .nextSidebarTab: return "shortcut.nextSidebarTab"
             case .prevSidebarTab: return "shortcut.prevSidebarTab"
+            case .renameTab: return "shortcut.renameTab"
+            case .renameWorkspace: return "shortcut.renameWorkspace"
+            case .closeWorkspace: return "shortcut.closeWorkspace"
             case .focusLeft: return "shortcut.focusLeft"
             case .focusRight: return "shortcut.focusRight"
             case .focusUp: return "shortcut.focusUp"
             case .focusDown: return "shortcut.focusDown"
             case .splitRight: return "shortcut.splitRight"
             case .splitDown: return "shortcut.splitDown"
+            case .splitBrowserRight: return "shortcut.splitBrowserRight"
+            case .splitBrowserDown: return "shortcut.splitBrowserDown"
             case .nextSurface: return "shortcut.nextSurface"
             case .prevSurface: return "shortcut.prevSurface"
             case .newSurface: return "shortcut.newSurface"
             case .openBrowser: return "shortcut.openBrowser"
+            case .toggleBrowserDeveloperTools: return "shortcut.toggleBrowserDeveloperTools"
+            case .showBrowserJavaScriptConsole: return "shortcut.showBrowserJavaScriptConsole"
             }
         }
 
@@ -86,6 +110,8 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "n", command: true, shift: false, option: false, control: false)
             case .newWindow:
                 return StoredShortcut(key: "n", command: true, shift: true, option: false, control: false)
+            case .closeWindow:
+                return StoredShortcut(key: "w", command: true, shift: false, option: false, control: true)
             case .showNotifications:
                 return StoredShortcut(key: "i", command: true, shift: false, option: false, control: false)
             case .jumpToUnread:
@@ -96,6 +122,12 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "]", command: true, shift: false, option: false, control: true)
             case .prevSidebarTab:
                 return StoredShortcut(key: "[", command: true, shift: false, option: false, control: true)
+            case .renameTab:
+                return StoredShortcut(key: "r", command: true, shift: false, option: false, control: false)
+            case .renameWorkspace:
+                return StoredShortcut(key: "r", command: true, shift: true, option: false, control: false)
+            case .closeWorkspace:
+                return StoredShortcut(key: "w", command: true, shift: true, option: false, control: false)
             case .focusLeft:
                 return StoredShortcut(key: "←", command: true, shift: false, option: true, control: false)
             case .focusRight:
@@ -108,6 +140,10 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "d", command: true, shift: false, option: false, control: false)
             case .splitDown:
                 return StoredShortcut(key: "d", command: true, shift: true, option: false, control: false)
+            case .splitBrowserRight:
+                return StoredShortcut(key: "d", command: true, shift: false, option: true, control: false)
+            case .splitBrowserDown:
+                return StoredShortcut(key: "d", command: true, shift: true, option: true, control: false)
             case .nextSurface:
                 return StoredShortcut(key: "]", command: true, shift: true, option: false, control: false)
             case .prevSurface:
@@ -116,6 +152,12 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "t", command: true, shift: false, option: false, control: false)
             case .openBrowser:
                 return StoredShortcut(key: "l", command: true, shift: true, option: false, control: false)
+            case .toggleBrowserDeveloperTools:
+                // Safari default: Show Web Inspector.
+                return StoredShortcut(key: "i", command: true, shift: false, option: true, control: false)
+            case .showBrowserJavaScriptConsole:
+                // Safari default: Show JavaScript Console.
+                return StoredShortcut(key: "c", command: true, shift: false, option: true, control: false)
             }
         }
 
@@ -168,6 +210,8 @@ enum KeyboardShortcutSettings {
 
     static func nextSidebarTabShortcut() -> StoredShortcut { shortcut(for: .nextSidebarTab) }
     static func prevSidebarTabShortcut() -> StoredShortcut { shortcut(for: .prevSidebarTab) }
+    static func renameWorkspaceShortcut() -> StoredShortcut { shortcut(for: .renameWorkspace) }
+    static func closeWorkspaceShortcut() -> StoredShortcut { shortcut(for: .closeWorkspace) }
 
     static func focusLeftShortcut() -> StoredShortcut { shortcut(for: .focusLeft) }
     static func focusRightShortcut() -> StoredShortcut { shortcut(for: .focusRight) }
@@ -176,12 +220,16 @@ enum KeyboardShortcutSettings {
 
     static func splitRightShortcut() -> StoredShortcut { shortcut(for: .splitRight) }
     static func splitDownShortcut() -> StoredShortcut { shortcut(for: .splitDown) }
+    static func splitBrowserRightShortcut() -> StoredShortcut { shortcut(for: .splitBrowserRight) }
+    static func splitBrowserDownShortcut() -> StoredShortcut { shortcut(for: .splitBrowserDown) }
 
     static func nextSurfaceShortcut() -> StoredShortcut { shortcut(for: .nextSurface) }
     static func prevSurfaceShortcut() -> StoredShortcut { shortcut(for: .prevSurface) }
     static func newSurfaceShortcut() -> StoredShortcut { shortcut(for: .newSurface) }
 
     static func openBrowserShortcut() -> StoredShortcut { shortcut(for: .openBrowser) }
+    static func toggleBrowserDeveloperToolsShortcut() -> StoredShortcut { shortcut(for: .toggleBrowserDeveloperTools) }
+    static func showBrowserJavaScriptConsoleShortcut() -> StoredShortcut { shortcut(for: .showBrowserJavaScriptConsole) }
 }
 
 /// A keyboard shortcut that can be stored in UserDefaults
@@ -216,6 +264,65 @@ struct StoredShortcut: Codable, Equatable {
         if option { flags.insert(.option) }
         if control { flags.insert(.control) }
         return flags
+    }
+
+    var keyEquivalent: KeyEquivalent? {
+        switch key {
+        case "←":
+            return .leftArrow
+        case "→":
+            return .rightArrow
+        case "↑":
+            return .upArrow
+        case "↓":
+            return .downArrow
+        case "\t":
+            return .tab
+        default:
+            let lowered = key.lowercased()
+            guard lowered.count == 1, let character = lowered.first else { return nil }
+            return KeyEquivalent(character)
+        }
+    }
+
+    var eventModifiers: EventModifiers {
+        var modifiers: EventModifiers = []
+        if command {
+            modifiers.insert(.command)
+        }
+        if shift {
+            modifiers.insert(.shift)
+        }
+        if option {
+            modifiers.insert(.option)
+        }
+        if control {
+            modifiers.insert(.control)
+        }
+        return modifiers
+    }
+
+    var menuItemKeyEquivalent: String? {
+        switch key {
+        case "←":
+            guard let scalar = UnicodeScalar(NSLeftArrowFunctionKey) else { return nil }
+            return String(Character(scalar))
+        case "→":
+            guard let scalar = UnicodeScalar(NSRightArrowFunctionKey) else { return nil }
+            return String(Character(scalar))
+        case "↑":
+            guard let scalar = UnicodeScalar(NSUpArrowFunctionKey) else { return nil }
+            return String(Character(scalar))
+        case "↓":
+            guard let scalar = UnicodeScalar(NSDownArrowFunctionKey) else { return nil }
+            return String(Character(scalar))
+        case "\t":
+            return "\t"
+        default:
+            let lowered = key.lowercased()
+            guard lowered.count == 1 else { return nil }
+            return lowered
+        }
     }
 
     static func from(event: NSEvent) -> StoredShortcut? {

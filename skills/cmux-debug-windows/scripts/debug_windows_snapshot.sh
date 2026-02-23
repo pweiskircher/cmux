@@ -5,8 +5,8 @@ usage() {
   cat <<'USAGE'
 Usage: debug_windows_snapshot.sh [--domain <defaults-domain>] [--copy]
 
-Collect Sidebar Debug, Background Debug, and Menu Bar Extra debug values from macOS defaults
-and print a combined payload. Use --copy to also copy the payload to clipboard.
+Collect Sidebar Debug, Background Debug, Menu Bar Extra, and Browser DevTools debug values
+from macOS defaults and print a combined payload. Use --copy to also copy the payload.
 
 Examples:
   debug_windows_snapshot.sh
@@ -93,6 +93,7 @@ sidebarBlurOpacity="$(format_number "$(read_value sidebarBlurOpacity 0.79)" 2)"
 sidebarTintHex="$(read_value sidebarTintHex '#101010')"
 sidebarTintOpacity="$(format_number "$(read_value sidebarTintOpacity 0.54)" 2)"
 sidebarCornerRadius="$(format_number "$(read_value sidebarCornerRadius 0.0)" 1)"
+sidebarActiveTabIndicatorStyle="$(read_value sidebarActiveTabIndicatorStyle solidFill)"
 shortcutHintSidebarXOffset="$(format_number "$(read_value shortcutHintSidebarXOffset 0.0)" 1)"
 shortcutHintSidebarYOffset="$(format_number "$(read_value shortcutHintSidebarYOffset 0.0)" 1)"
 shortcutHintTitlebarXOffset="$(format_number "$(read_value shortcutHintTitlebarXOffset 4.0)" 1)"
@@ -118,12 +119,15 @@ menubarDebugSingleDigitYOffset="$(format_number "$(read_value menubarDebugSingle
 menubarDebugMultiDigitYOffset="$(format_number "$(read_value menubarDebugMultiDigitYOffset 0.60)" 2)"
 legacySingleDigitX="$(read_value menubarDebugTextRectXAdjust '')"
 if [[ -n "$legacySingleDigitX" ]]; then
-  menubarDebugSingleDigitXAdjust="$(format_number "$legacySingleDigitX" 2)"
+menubarDebugSingleDigitXAdjust="$(format_number "$legacySingleDigitX" 2)"
 else
   menubarDebugSingleDigitXAdjust="$(format_number "$(read_value menubarDebugSingleDigitXAdjust -1.10)" 2)"
 fi
 menubarDebugMultiDigitXAdjust="$(format_number "$(read_value menubarDebugMultiDigitXAdjust 2.42)" 2)"
 menubarDebugTextRectWidthAdjust="$(format_number "$(read_value menubarDebugTextRectWidthAdjust 1.80)" 2)"
+
+browserDevToolsIconName="$(read_value browserDevToolsIconName 'wrench.and.screwdriver')"
+browserDevToolsIconColor="$(read_value browserDevToolsIconColor bonsplitInactive)"
 
 payload="$(cat <<PAYLOAD
 # Defaults domain
@@ -138,6 +142,7 @@ sidebarBlurOpacity=$sidebarBlurOpacity
 sidebarTintHex=$sidebarTintHex
 sidebarTintOpacity=$sidebarTintOpacity
 sidebarCornerRadius=$sidebarCornerRadius
+sidebarActiveTabIndicatorStyle=$sidebarActiveTabIndicatorStyle
 shortcutHintSidebarXOffset=$shortcutHintSidebarXOffset
 shortcutHintSidebarYOffset=$shortcutHintSidebarYOffset
 shortcutHintTitlebarXOffset=$shortcutHintTitlebarXOffset
@@ -166,6 +171,10 @@ menubarDebugMultiDigitYOffset=$menubarDebugMultiDigitYOffset
 menubarDebugSingleDigitXAdjust=$menubarDebugSingleDigitXAdjust
 menubarDebugMultiDigitXAdjust=$menubarDebugMultiDigitXAdjust
 menubarDebugTextRectWidthAdjust=$menubarDebugTextRectWidthAdjust
+
+# Browser DevTools Button
+browserDevToolsIconName=$browserDevToolsIconName
+browserDevToolsIconColor=$browserDevToolsIconColor
 PAYLOAD
 )"
 

@@ -20,25 +20,232 @@ private func portalDebugFrame(_ rect: NSRect) -> String {
 #endif
 
 final class WindowTerminalHostView: NSView {
+    private struct DividerRegion {
+        let rectInWindow: NSRect
+        let isVertical: Bool
+    }
+
+    private enum DividerCursorKind: Equatable {
+        case vertical
+        case horizontal
+
+        var cursor: NSCursor {
+            switch self {
+            case .vertical: return .resizeLeftRight
+            case .horizontal: return .resizeUpDown
+            }
+        }
+    }
+
     override var isOpaque: Bool { false }
+    private static let sidebarLeadingEdgeEpsilon: CGFloat = 1
+    private static let minimumVisibleLeadingContentWidth: CGFloat = 24
+    private var cachedSidebarDividerX: CGFloat?
+    private var sidebarDividerMissCount = 0
+    private var trackingArea: NSTrackingArea?
+    private var activeDividerCursorKind: DividerCursorKind?
+#if DEBUG
+    private var lastDragRouteSignature: String?
+#endif
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            clearActiveDividerCursor(restoreArrow: false)
+        }
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func setFrameOrigin(_ newOrigin: NSPoint) {
+        super.setFrameOrigin(newOrigin)
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard let window, let rootView = window.contentView else { return }
+        var regions: [DividerRegion] = []
+        Self.collectSplitDividerRegions(in: rootView, into: &regions)
+        let expansion: CGFloat = 4
+        for region in regions {
+            var rectInHost = convert(region.rectInWindow, from: nil)
+            rectInHost = rectInHost.insetBy(
+                dx: region.isVertical ? -expansion : 0,
+                dy: region.isVertical ? 0 : -expansion
+            )
+            let clipped = rectInHost.intersection(bounds)
+            guard !clipped.isNull, clipped.width > 0, clipped.height > 0 else { continue }
+            addCursorRect(clipped, cursor: region.isVertical ? .resizeLeftRight : .resizeUpDown)
+        }
+    }
+
+    override func updateTrackingAreas() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let options: NSTrackingArea.Options = [
+            .inVisibleRect,
+            .activeAlways,
+            .cursorUpdate,
+            .mouseMoved,
+            .mouseEnteredAndExited,
+            .enabledDuringMouseDrag,
+        ]
+        let next = NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil)
+        addTrackingArea(next)
+        trackingArea = next
+        super.updateTrackingAreas()
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        updateDividerCursor(at: point)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        updateDividerCursor(at: point)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        clearActiveDividerCursor(restoreArrow: true)
+    }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
+        updateDividerCursor(at: point)
+
+        if shouldPassThroughToSidebarResizer(at: point) {
+            return nil
+        }
+
         if shouldPassThroughToSplitDivider(at: point) {
             return nil
         }
+
+        let dragPasteboardTypes = NSPasteboard(name: .drag).types
+        let eventType = NSApp.currentEvent?.type
+        let shouldPassThrough = DragOverlayRoutingPolicy.shouldPassThroughPortalHitTesting(
+            pasteboardTypes: dragPasteboardTypes,
+            eventType: eventType
+        )
+        if shouldPassThrough {
+#if DEBUG
+            logDragRouteDecision(
+                passThrough: true,
+                eventType: eventType,
+                pasteboardTypes: dragPasteboardTypes,
+                hitView: nil
+            )
+#endif
+            return nil
+        }
+
         let hitView = super.hitTest(point)
+#if DEBUG
+        logDragRouteDecision(
+            passThrough: false,
+            eventType: eventType,
+            pasteboardTypes: dragPasteboardTypes,
+            hitView: hitView
+        )
+#endif
         return hitView === self ? nil : hitView
     }
 
-    private func shouldPassThroughToSplitDivider(at point: NSPoint) -> Bool {
-        guard let window else { return false }
-        let windowPoint = convert(point, to: nil)
-        guard let rootView = window.contentView else { return false }
-        return Self.containsSplitDivider(at: windowPoint, in: rootView)
+    private func shouldPassThroughToSidebarResizer(at point: NSPoint) -> Bool {
+        // The sidebar resizer handle is implemented in SwiftUI. When terminals
+        // are portal-hosted, this AppKit host can otherwise sit above the handle
+        // and steal hover/mouse events.
+        let visibleHostedViews = subviews.compactMap { $0 as? GhosttySurfaceScrollView }
+            .filter { !$0.isHidden && $0.window != nil && $0.frame.width > 1 && $0.frame.height > 1 }
+
+        // If content is flush to the leading edge, sidebar is effectively hidden.
+        // In that state, treating any internal split edge as a sidebar divider
+        // steals split-divider cursor/drag behavior.
+        let hasLeadingContent = visibleHostedViews.contains {
+            $0.frame.minX <= Self.sidebarLeadingEdgeEpsilon
+                && $0.frame.maxX > Self.minimumVisibleLeadingContentWidth
+        }
+        if hasLeadingContent {
+            if cachedSidebarDividerX != nil {
+                sidebarDividerMissCount += 1
+                if sidebarDividerMissCount >= 2 {
+                    cachedSidebarDividerX = nil
+                    sidebarDividerMissCount = 0
+                }
+            }
+            return false
+        }
+
+        // Ignore transient 0-origin hosts while layouts churn (e.g. workspace
+        // creation/switching). They can temporarily report minX=0 and would
+        // otherwise clear divider pass-through, causing hover flicker.
+        let dividerCandidates = visibleHostedViews
+            .map(\.frame.minX)
+            .filter { $0 > Self.sidebarLeadingEdgeEpsilon }
+        if let leftMostEdge = dividerCandidates.min() {
+            cachedSidebarDividerX = leftMostEdge
+            sidebarDividerMissCount = 0
+        } else if cachedSidebarDividerX != nil {
+            // Keep cache briefly for layout churn, but clear if we miss repeatedly
+            // so stale divider positions don't steal pointer routing.
+            sidebarDividerMissCount += 1
+            if sidebarDividerMissCount >= 4 {
+                cachedSidebarDividerX = nil
+                sidebarDividerMissCount = 0
+            }
+        }
+
+        guard let dividerX = cachedSidebarDividerX else {
+            return false
+        }
+
+        let regionMinX = dividerX - SidebarResizeInteraction.hitWidthPerSide
+        let regionMaxX = dividerX + SidebarResizeInteraction.hitWidthPerSide
+        return point.x >= regionMinX && point.x <= regionMaxX
     }
 
-    private static func containsSplitDivider(at windowPoint: NSPoint, in view: NSView) -> Bool {
-        guard !view.isHidden else { return false }
+    private func updateDividerCursor(at point: NSPoint) {
+        if shouldPassThroughToSidebarResizer(at: point) {
+            clearActiveDividerCursor(restoreArrow: false)
+            return
+        }
+
+        guard let nextKind = splitDividerCursorKind(at: point) else {
+            clearActiveDividerCursor(restoreArrow: true)
+            return
+        }
+        activeDividerCursorKind = nextKind
+        nextKind.cursor.set()
+    }
+
+    private func clearActiveDividerCursor(restoreArrow: Bool) {
+        guard activeDividerCursorKind != nil else { return }
+        window?.invalidateCursorRects(for: self)
+        activeDividerCursorKind = nil
+        if restoreArrow {
+            NSCursor.arrow.set()
+        }
+    }
+
+    private func splitDividerCursorKind(at point: NSPoint) -> DividerCursorKind? {
+        guard let window else { return nil }
+        let windowPoint = convert(point, to: nil)
+        guard let rootView = window.contentView else { return nil }
+        return Self.dividerCursorKind(at: windowPoint, in: rootView)
+    }
+
+    private func shouldPassThroughToSplitDivider(at point: NSPoint) -> Bool {
+        splitDividerCursorKind(at: point) != nil
+    }
+
+    private static func dividerCursorKind(at windowPoint: NSPoint, in view: NSView) -> DividerCursorKind? {
+        guard !view.isHidden else { return nil }
 
         if let splitView = view as? NSSplitView {
             let pointInSplit = splitView.convert(windowPoint, from: nil)
@@ -53,7 +260,10 @@ final class WindowTerminalHostView: NSView {
                     let thickness = splitView.dividerThickness
                     let dividerRect: NSRect
                     if splitView.isVertical {
-                        guard first.width > 1, second.width > 1 else { continue }
+                        // Keep divider hit-testing active even when one side is nearly collapsed,
+                        // so users can drag the divider back out from the border.
+                        // But ignore transient states where both panes are effectively 0-width.
+                        guard first.width > 1 || second.width > 1 else { continue }
                         let x = max(0, first.maxX)
                         dividerRect = NSRect(
                             x: x,
@@ -62,7 +272,8 @@ final class WindowTerminalHostView: NSView {
                             height: splitView.bounds.height
                         )
                     } else {
-                        guard first.height > 1, second.height > 1 else { continue }
+                        // Same behavior for horizontal splits with a near-zero-height pane.
+                        guard first.height > 1 || second.height > 1 else { continue }
                         let y = max(0, first.maxY)
                         dividerRect = NSRect(
                             x: 0,
@@ -73,19 +284,246 @@ final class WindowTerminalHostView: NSView {
                     }
                     let expandedDividerRect = dividerRect.insetBy(dx: -expansion, dy: -expansion)
                     if expandedDividerRect.contains(pointInSplit) {
-                        return true
+                        return splitView.isVertical ? .vertical : .horizontal
                     }
                 }
             }
         }
 
         for subview in view.subviews.reversed() {
-            if containsSplitDivider(at: windowPoint, in: subview) {
-                return true
+            if let kind = dividerCursorKind(at: windowPoint, in: subview) {
+                return kind
             }
         }
 
+        return nil
+    }
+
+    private static func collectSplitDividerRegions(in view: NSView, into result: inout [DividerRegion]) {
+        guard !view.isHidden else { return }
+
+        if let splitView = view as? NSSplitView {
+            let dividerCount = max(0, splitView.arrangedSubviews.count - 1)
+            for dividerIndex in 0..<dividerCount {
+                let first = splitView.arrangedSubviews[dividerIndex].frame
+                let second = splitView.arrangedSubviews[dividerIndex + 1].frame
+                let thickness = splitView.dividerThickness
+                let dividerRect: NSRect
+                if splitView.isVertical {
+                    guard first.width > 1 || second.width > 1 else { continue }
+                    let x = max(0, first.maxX)
+                    dividerRect = NSRect(x: x, y: 0, width: thickness, height: splitView.bounds.height)
+                } else {
+                    guard first.height > 1 || second.height > 1 else { continue }
+                    let y = max(0, first.maxY)
+                    dividerRect = NSRect(x: 0, y: y, width: splitView.bounds.width, height: thickness)
+                }
+                let dividerRectInWindow = splitView.convert(dividerRect, to: nil)
+                guard dividerRectInWindow.width > 0, dividerRectInWindow.height > 0 else { continue }
+                result.append(
+                    DividerRegion(
+                        rectInWindow: dividerRectInWindow,
+                        isVertical: splitView.isVertical
+                    )
+                )
+            }
+        }
+
+        for subview in view.subviews {
+            collectSplitDividerRegions(in: subview, into: &result)
+        }
+    }
+
+#if DEBUG
+    private func logDragRouteDecision(
+        passThrough: Bool,
+        eventType: NSEvent.EventType?,
+        pasteboardTypes: [NSPasteboard.PasteboardType]?,
+        hitView: NSView?
+    ) {
+        let hasRelevantTypes = DragOverlayRoutingPolicy.hasBonsplitTabTransfer(pasteboardTypes)
+            || DragOverlayRoutingPolicy.hasSidebarTabReorder(pasteboardTypes)
+        guard passThrough || hasRelevantTypes else { return }
+
+        let targetClass = hitView.map { NSStringFromClass(type(of: $0)) } ?? "nil"
+        let signature = [
+            passThrough ? "1" : "0",
+            debugEventName(eventType),
+            debugPasteboardTypes(pasteboardTypes),
+            targetClass,
+        ].joined(separator: "|")
+        guard lastDragRouteSignature != signature else { return }
+        lastDragRouteSignature = signature
+
+        dlog(
+            "portal.dragRoute passThrough=\(passThrough ? 1 : 0) " +
+            "event=\(debugEventName(eventType)) target=\(targetClass) " +
+            "types=\(debugPasteboardTypes(pasteboardTypes))"
+        )
+    }
+
+    private func debugPasteboardTypes(_ types: [NSPasteboard.PasteboardType]?) -> String {
+        guard let types, !types.isEmpty else { return "-" }
+        return types.map(\.rawValue).joined(separator: ",")
+    }
+
+    private func debugEventName(_ eventType: NSEvent.EventType?) -> String {
+        guard let eventType else { return "none" }
+        switch eventType {
+        case .cursorUpdate: return "cursorUpdate"
+        case .appKitDefined: return "appKitDefined"
+        case .systemDefined: return "systemDefined"
+        case .applicationDefined: return "applicationDefined"
+        case .periodic: return "periodic"
+        case .mouseMoved: return "mouseMoved"
+        case .mouseEntered: return "mouseEntered"
+        case .mouseExited: return "mouseExited"
+        case .flagsChanged: return "flagsChanged"
+        case .leftMouseDragged: return "leftMouseDragged"
+        case .rightMouseDragged: return "rightMouseDragged"
+        case .otherMouseDragged: return "otherMouseDragged"
+        case .leftMouseDown: return "leftMouseDown"
+        case .leftMouseUp: return "leftMouseUp"
+        case .rightMouseDown: return "rightMouseDown"
+        case .rightMouseUp: return "rightMouseUp"
+        case .otherMouseDown: return "otherMouseDown"
+        case .otherMouseUp: return "otherMouseUp"
+        default: return "other(\(eventType.rawValue))"
+        }
+    }
+#endif
+}
+
+private final class SplitDividerOverlayView: NSView {
+    private struct DividerSegment {
+        let rect: NSRect
+        let color: NSColor
+        let isVertical: Bool
+    }
+
+    override var isOpaque: Bool { false }
+    override var acceptsFirstResponder: Bool { false }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let window, let rootView = window.contentView else { return }
+
+        var dividerSegments: [DividerSegment] = []
+        collectDividerSegments(in: rootView, into: &dividerSegments)
+        guard !dividerSegments.isEmpty else { return }
+        let hostedFrames = hostedFramesLikelyToOccludeDividers()
+        let visibleSegments = dividerSegments.filter { shouldRenderOverlay(for: $0, hostedFrames: hostedFrames) }
+        guard !visibleSegments.isEmpty else { return }
+
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+
+        // Keep separators visible above portal-hosted surfaces while matching each split view's
+        // native divider color (avoids visible color shifts at tiny pane sizes).
+        for segment in visibleSegments where segment.rect.intersects(dirtyRect) {
+            segment.color.setFill()
+            let rect = segment.rect
+            let pixelAligned = NSRect(
+                x: floor(rect.origin.x),
+                y: floor(rect.origin.y),
+                width: max(1, round(rect.size.width)),
+                height: max(1, round(rect.size.height))
+            )
+            NSBezierPath(rect: pixelAligned).fill()
+        }
+    }
+
+    private func collectDividerSegments(in view: NSView, into result: inout [DividerSegment]) {
+        guard !view.isHidden else { return }
+
+        if let splitView = view as? NSSplitView {
+            let dividerCount = max(0, splitView.arrangedSubviews.count - 1)
+            let dividerColor = overlayDividerColor(for: splitView)
+            for dividerIndex in 0..<dividerCount {
+                let first = splitView.arrangedSubviews[dividerIndex].frame
+                let thickness = max(splitView.dividerThickness, 1)
+                let dividerRectInSplit: NSRect
+                if splitView.isVertical {
+                    dividerRectInSplit = NSRect(
+                        x: first.maxX,
+                        y: 0,
+                        width: thickness,
+                        height: splitView.bounds.height
+                    )
+                } else {
+                    dividerRectInSplit = NSRect(
+                        x: 0,
+                        y: first.maxY,
+                        width: splitView.bounds.width,
+                        height: thickness
+                    )
+                }
+
+                let dividerRectInWindow = splitView.convert(dividerRectInSplit, to: nil)
+                let dividerRectInOverlay = convert(dividerRectInWindow, from: nil)
+                if dividerRectInOverlay.intersects(bounds) {
+                    result.append(
+                        DividerSegment(
+                            rect: dividerRectInOverlay,
+                            color: dividerColor,
+                            isVertical: splitView.isVertical
+                        )
+                    )
+                }
+            }
+        }
+
+        for subview in view.subviews {
+            collectDividerSegments(in: subview, into: &result)
+        }
+    }
+
+    private func hostedFramesLikelyToOccludeDividers() -> [NSRect] {
+        guard let hostView = superview else { return [] }
+        return hostView.subviews.compactMap { subview -> NSRect? in
+            guard let hosted = subview as? GhosttySurfaceScrollView else { return nil }
+            guard !hosted.isHidden, hosted.window != nil else { return nil }
+            return hosted.frame
+        }
+    }
+
+    private func shouldRenderOverlay(for segment: DividerSegment, hostedFrames: [NSRect]) -> Bool {
+        // Draw only when a hosted surface actually intrudes across the divider centerline.
+        // This preserves tiny-pane visibility fixes without darkening regular dividers.
+        let axisEpsilon: CGFloat = 0.01
+        let axis = segment.isVertical ? segment.rect.midX : segment.rect.midY
+        let extentRect = segment.rect.insetBy(
+            dx: segment.isVertical ? 0 : -1,
+            dy: segment.isVertical ? -1 : 0
+        )
+
+        for frame in hostedFrames where frame.intersects(extentRect) {
+            if segment.isVertical {
+                if frame.minX < axis - axisEpsilon && frame.maxX > axis + axisEpsilon {
+                    return true
+                }
+            } else if frame.minY < axis - axisEpsilon && frame.maxY > axis + axisEpsilon {
+                return true
+            }
+        }
         return false
+    }
+
+    private func overlayDividerColor(for splitView: NSSplitView) -> NSColor {
+        let divider = splitView.dividerColor.usingColorSpace(.deviceRGB) ?? splitView.dividerColor
+        let alpha = divider.alphaComponent
+        guard alpha < 0.999 else { return divider }
+
+        guard let bgColor = splitView.layer?.backgroundColor.flatMap(NSColor.init(cgColor:)),
+              let bgRGB = bgColor.usingColorSpace(.deviceRGB) else {
+            return divider
+        }
+
+        let opaqueBG = bgRGB.withAlphaComponent(1)
+        let opaqueDivider = divider.withAlphaComponent(1)
+        return opaqueBG.blended(withFraction: alpha, of: opaqueDivider) ?? divider
     }
 }
 
@@ -93,6 +531,7 @@ final class WindowTerminalHostView: NSView {
 final class WindowTerminalPortal: NSObject {
     private weak var window: NSWindow?
     private let hostView = WindowTerminalHostView(frame: .zero)
+    private let dividerOverlayView = SplitDividerOverlayView(frame: .zero)
     private weak var installedContainerView: NSView?
     private weak var installedReferenceView: NSView?
     private var installConstraints: [NSLayoutConstraint] = []
@@ -113,7 +552,23 @@ final class WindowTerminalPortal: NSObject {
         super.init()
         hostView.wantsLayer = false
         hostView.translatesAutoresizingMaskIntoConstraints = false
+        dividerOverlayView.translatesAutoresizingMaskIntoConstraints = true
+        dividerOverlayView.autoresizingMask = [.width, .height]
         _ = ensureInstalled()
+    }
+
+    private func ensureDividerOverlayOnTop() {
+        if dividerOverlayView.superview !== hostView {
+            dividerOverlayView.frame = hostView.bounds
+            hostView.addSubview(dividerOverlayView, positioned: .above, relativeTo: nil)
+        } else if hostView.subviews.last !== dividerOverlayView {
+            hostView.addSubview(dividerOverlayView, positioned: .above, relativeTo: nil)
+        }
+
+        if !Self.rectApproximatelyEqual(dividerOverlayView.frame, hostView.bounds) {
+            dividerOverlayView.frame = hostView.bounds
+        }
+        dividerOverlayView.needsDisplay = true
     }
 
     @discardableResult
@@ -149,6 +604,8 @@ final class WindowTerminalPortal: NSObject {
            !Self.isView(overlay, above: hostView, in: container) {
             container.addSubview(overlay, positioned: .above, relativeTo: hostView)
         }
+
+        ensureDividerOverlayOnTop()
 
         return true
     }
@@ -305,6 +762,8 @@ final class WindowTerminalPortal: NSObject {
             hostView.addSubview(hostedView, positioned: .above, relativeTo: nil)
         }
 
+        ensureDividerOverlayOnTop()
+
         synchronizeHostedView(withId: hostedId)
         pruneDeadEntries()
     }
@@ -434,6 +893,8 @@ final class WindowTerminalPortal: NSObject {
 #endif
             hostedView.isHidden = shouldHide
         }
+
+        ensureDividerOverlayOnTop()
     }
 
     private func pruneDeadEntries() {
